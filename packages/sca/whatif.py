@@ -96,6 +96,15 @@ def main(
             osv, kev, epss,
         )
 
+    if args.explain and not (args.add or args.remove or args.from_file):
+        explain_section = _explain_upgrade(
+            args.ecosystem, args.name,
+            args.from_version, args.to_version or (args.candidate[0] if args.candidate else ""),
+            target=Path(args.target) if args.target else None,
+        )
+        if explain_section:
+            report += explain_section
+
     if args.out:
         out = Path(args.out).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +165,15 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
              "--candidate latest``",
     )
     p.add_argument("--out", help="markdown output path")
+    p.add_argument(
+        "--explain", action="store_true",
+        help="LLM upgrade impact analysis: grep call sites in --target, "
+             "classify as safe / minor_migration / major_migration",
+    )
+    p.add_argument(
+        "--target", metavar="PATH",
+        help="project root for --explain call-site grep (required with --explain)",
+    )
     p.add_argument("--offline", action="store_true")
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--no-kev", action="store_true")
@@ -551,6 +569,56 @@ def _advisory_line(f: VulnFinding) -> str:
             + (f" ({aliases})" if aliases else "")
             + (f" — {summary}" if summary else "")
             + "\n")
+
+
+def _explain_upgrade(
+    ecosystem: str,
+    name: str,
+    from_version: str,
+    to_version: str,
+    *,
+    target: Optional[Path] = None,
+) -> str:
+    """Run LLM upgrade-impact analysis and return a markdown section."""
+    if not to_version:
+        return ""
+
+    from .llm import get_llm_client
+    from .llm.upgrade_impact_review import assess_upgrade_impact
+
+    client = get_llm_client()
+    if client is None:
+        return "\n## Upgrade impact (LLM)\n\nNo LLM available — skipping.\n"
+
+    dep = _synthesise(ecosystem, name, from_version)
+    if target is None:
+        target = Path.cwd()
+
+    verdict = assess_upgrade_impact(client, dep, to_version, target)
+    if verdict is None:
+        return "\n## Upgrade impact (LLM)\n\nLLM analysis failed.\n"
+
+    lines: List[str] = [
+        "",
+        "## Upgrade impact (LLM)",
+        "",
+        f"**Verdict:** {verdict.verdict.replace('_', ' ')}",
+        f"**Confidence:** {verdict.confidence}",
+    ]
+    if verdict.summary:
+        lines.append(f"\n{verdict.summary}")
+
+    if verdict.breaking_changes:
+        lines.append("")
+        lines.append("### Breaking changes")
+        lines.append("")
+        for bc in verdict.breaking_changes:
+            lines.append(f"- **{bc.site}**: {bc.what_breaks}")
+            if bc.suggested_fix:
+                lines.append(f"  - Fix: {bc.suggested_fix}")
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 __all__ = ["main"]

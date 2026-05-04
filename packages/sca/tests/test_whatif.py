@@ -239,3 +239,51 @@ def test_writes_report_to_out(tmp_path: Path, capsys) -> None:
                 http=http, cache=cache)
     assert out.exists()
     assert "sca whatif" in out.read_text()
+
+
+# ---------------------------------------------------------------------------
+# --explain (LLM upgrade impact)
+# ---------------------------------------------------------------------------
+
+def test_explain_appends_llm_section_when_available(tmp_path: Path, capsys) -> None:
+    """When --explain is set and LLM is available, the report gains an impact section."""
+    from unittest.mock import patch as _patch, MagicMock
+
+    http = StubHttp(version_to_vulns={"1.0": [], "2.0": []}, records={})
+    cache = JsonCache(root=tmp_path / "cache")
+
+    mock_verdict = MagicMock()
+    mock_verdict.verdict = "safe"
+    mock_verdict.confidence = "high"
+    mock_verdict.summary = "No call sites found for x"
+    mock_verdict.breaking_changes = []
+
+    with _patch("packages.sca.llm.get_llm_client") as mock_get:
+        mock_get.return_value = MagicMock()
+        with _patch("packages.sca.llm.upgrade_impact_review.assess_upgrade_impact",
+                     return_value=mock_verdict):
+            whatif.main(
+                ["npm", "x", "1.0", "2.0", "--explain", "--target", str(tmp_path)],
+                http=http, cache=cache,
+            )
+    captured = capsys.readouterr()
+    assert "Upgrade impact (LLM)" in captured.out
+    assert "safe" in captured.out
+
+
+def test_explain_degrades_when_no_llm(tmp_path: Path, capsys) -> None:
+    """--explain without LLM shows a degradation notice."""
+    from unittest.mock import patch as _patch
+
+    http = StubHttp(version_to_vulns={"1.0": [], "2.0": []}, records={})
+    cache = JsonCache(root=tmp_path / "cache")
+
+    with _patch("packages.sca.llm.get_llm_client", return_value=None):
+        with _patch("packages.sca.llm.upgrade_impact_review.assess_upgrade_impact") as mock_assess:
+            whatif.main(
+                ["npm", "x", "1.0", "2.0", "--explain", "--target", str(tmp_path)],
+                http=http, cache=cache,
+            )
+    captured = capsys.readouterr()
+    assert "No LLM available" in captured.out
+    mock_assess.assert_not_called()
