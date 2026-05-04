@@ -61,6 +61,7 @@ _RULE_NAMES: Dict[str, str] = {
     "sca:supply_chain:install_hook_suspicious": "InstallHookSuspicious",
     "sca:supply_chain:python_pth_file": "PythonPthFile",
     "sca:supply_chain:binary_in_tests": "BinaryInTests",
+    "sca:supply_chain:sentinel_match": "SentinelMatch",
 }
 
 # Description text for each rule. Falls back to the vuln_type when a rule
@@ -95,6 +96,9 @@ _RULE_DESCRIPTIONS: Dict[str, str] = {
     "sca:supply_chain:binary_in_tests":
         "A large binary file under a test directory; could be a legitimate "
         "fixture or a hidden payload.",
+    "sca:supply_chain:sentinel_match":
+        "The dependency exactly matches a known-malicious package from a "
+        "documented supply-chain incident.",
 }
 
 

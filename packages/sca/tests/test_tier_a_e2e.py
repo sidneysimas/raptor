@@ -280,3 +280,7 @@ def test_tier_a_signals_all_present(tmp_path: Path) -> None:
     assert "backend/requirements.txt" in examined
     # Reachability file must show up in coverage too.
     assert any("backend/src/app.py" in f for f in examined)
+    # rules_applied tracks which analysis stages ran.
+    rules = set(cov.get("rules_applied", []))
+    assert "osv" in rules
+    assert "hygiene" in rules
