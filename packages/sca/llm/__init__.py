@@ -185,6 +185,104 @@ def run_stage(
 
 
 # ------------------------------------------------------------------
+# Cross-family verification
+# ------------------------------------------------------------------
+
+def cross_family_check(
+    *,
+    client,
+    system: str,
+    untrusted_blocks: tuple[UntrustedBlock, ...],
+    slots: Dict[str, TaintedString],
+    schema_cls: Type[BaseModel],
+    primary_result: StageResult,
+    verdict_field: str = "verdict",
+    high_severity_values: tuple[str, ...] = ("malicious", "suspicious"),
+    task_type: str = _TASK_TYPE,
+) -> StageResult:
+    """Re-run a stage with a different-family model when the primary
+    verdict is high-severity.
+
+    Returns the primary result unchanged when:
+    - the primary verdict is not high-severity,
+    - no cross-family model is available,
+    - the checker call fails.
+
+    When both models agree, confidence stays. When they disagree, the
+    conservative (higher-severity) verdict wins but confidence is capped
+    at ``"medium"``.
+    """
+    if primary_result.model is None:
+        return primary_result
+    primary_verdict = getattr(primary_result.model, verdict_field, None)
+    if primary_verdict not in high_severity_values:
+        return primary_result
+
+    checker_model = _select_checker(client)
+    if checker_model is None:
+        logger.debug("sca.llm: no cross-family model available")
+        return primary_result
+
+    checker_result = run_stage(
+        client=client,
+        system=system,
+        untrusted_blocks=untrusted_blocks,
+        slots=slots,
+        schema_cls=schema_cls,
+        model_id=checker_model,
+        task_type=task_type + "_cross_check",
+    )
+
+    if checker_result.model is None:
+        return primary_result
+
+    checker_verdict = getattr(checker_result.model, verdict_field, None)
+    if checker_verdict == primary_verdict:
+        logger.info("sca.llm: cross-family check agreed: %s", primary_verdict)
+        return primary_result
+
+    logger.info(
+        "sca.llm: cross-family disagreement: primary=%s checker=%s "
+        "— taking conservative (primary)",
+        primary_verdict, checker_verdict,
+    )
+    if hasattr(primary_result.model, "confidence"):
+        updated = primary_result.model.model_copy(
+            update={"confidence": "medium"},
+        )
+        return StageResult(
+            model=updated,
+            raw=primary_result.raw,
+            preflight_hit=primary_result.preflight_hit,
+            confidence_haircut=primary_result.confidence_haircut,
+            cost=primary_result.cost + checker_result.cost,
+        )
+    return primary_result
+
+
+def _select_checker(client) -> Optional[str]:
+    """Pick a cross-family model from the client's config."""
+    try:
+        from core.security.llm_family import select_cross_family_checker
+        primary = _resolve_model_id(client)
+        candidates = []
+        cfg = client.config
+        if hasattr(cfg, "consensus_models"):
+            candidates.extend(
+                f"{m.provider}/{m.model_name}" for m in cfg.consensus_models
+                if m.enabled
+            )
+        if hasattr(cfg, "fallback_models"):
+            candidates.extend(
+                f"{m.provider}/{m.model_name}" for m in cfg.fallback_models
+                if m.enabled
+            )
+        return select_cross_family_checker(primary, candidates)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 
