@@ -1,4 +1,4 @@
-"""Tests for ``sca update --git-patch``: emit a git-apply-compatible
+"""Tests for ``raptor-sca fix --cve-only --git-patch``: emit a git-apply-compatible
 unified diff alongside ``proposed/``."""
 
 from __future__ import annotations

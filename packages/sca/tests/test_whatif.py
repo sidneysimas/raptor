@@ -1,4 +1,4 @@
-"""Tests for ``packages.sca.whatif`` (the ``/sca whatif`` subcommand)."""
+"""Tests for ``packages.sca.whatif`` (the ``raptor-sca upgrade`` subcommand)."""
 
 from __future__ import annotations
 
@@ -238,7 +238,7 @@ def test_writes_report_to_out(tmp_path: Path, capsys) -> None:
     whatif.main(["npm", "x", "1.0", "2.0", "--out", str(out)],
                 http=http, cache=cache)
     assert out.exists()
-    assert "sca whatif" in out.read_text()
+    assert "raptor-sca upgrade" in out.read_text()
 
 
 # ---------------------------------------------------------------------------

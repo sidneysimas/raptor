@@ -15,6 +15,7 @@ in the supply-chain threat model.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import List, Optional
@@ -121,12 +122,13 @@ def _grep_call_sites(target: Path, dep: Dependency) -> List[str]:
     skip_dirs = {"node_modules", "vendor", ".git", "__pycache__",
                  "target", "build", "dist", ".venv", "venv"}
 
-    for root, dirs, files in target.walk():
+    for root, dirs, files in os.walk(target, onerror=lambda _e: None):
         dirs[:] = [d for d in dirs if d not in skip_dirs]
+        root_path = Path(root)
         for fname in files:
             if Path(fname).suffix not in extensions:
                 continue
-            fpath = root / fname
+            fpath = root_path / fname
             try:
                 text = fpath.read_text(encoding="utf-8", errors="replace")
             except Exception:  # noqa: BLE001

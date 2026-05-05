@@ -1,4 +1,4 @@
-"""Versioned per-stage prompt skeletons for ``/sca`` LLM stages.
+"""Versioned per-stage prompt skeletons for ``raptor-sca`` LLM stages.
 
 Each prompt carries a ``_VERSION`` so we can correlate prompt changes
 with finding diffs over time.  Version bumps happen when the prompt
@@ -159,8 +159,8 @@ Consider:
 - Multiple correlated supply-chain signals on the same dep compound
 - dev-only dependencies warrant lower priority unless the dep is also \
   used in CI/CD
-- Cross-tool context (if present): a dep flagged by both /sca and \
-  /scan or /codeql is higher priority than either alone
+- Cross-tool context (if present): a dep flagged by both raptor-sca \
+  and /scan or /codeql is higher priority than either alone
 
 Return the required JSON schema.  ``finding_id`` must match the IDs \
 in the input exactly.  ``one_line_rationale`` should be actionable \

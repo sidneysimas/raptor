@@ -1,9 +1,9 @@
 """Tests for ``packages.sca.patch_apply.apply_patch_to_target``.
 
-Both ``/sca harden --apply`` and ``/sca update --apply`` share this
-helper. The tests stub ``subprocess.run`` so no real ``git apply`` is
-fired — we're testing the pre-flight (refusal policy + path
-resolution + log lines) and the result-mapping (exit-code translation).
+Both ``raptor-sca fix --harden --apply`` and ``raptor-sca fix --cve-only --apply``
+share this helper. The tests stub ``subprocess.run`` so no real ``git apply``
+is fired — we're testing the pre-flight (refusal policy + path resolution +
+log lines) and the result-mapping (exit-code translation).
 """
 
 from __future__ import annotations
@@ -64,10 +64,10 @@ def test_clean_apply_returns_zero(
         lambda *a, **kw: subprocess.CompletedProcess(
             args=a[0], returncode=0, stdout="", stderr=""),
     )
-    rc = apply_patch_to_target(tmp_path, patch, caller_label="sca update")
+    rc = apply_patch_to_target(tmp_path, patch, caller_label="raptor-sca fix --cve-only")
     assert rc == 0
     out = capsys.readouterr().out
-    assert "sca update --apply" in out
+    assert "raptor-sca fix --cve-only --apply" in out
 
 
 def test_apply_failure_propagates_returncode(
@@ -119,6 +119,6 @@ def test_caller_label_threads_into_log_lines(
         lambda *a, **kw: subprocess.CompletedProcess(
             args=a[0], returncode=0, stdout="", stderr=""),
     )
-    apply_patch_to_target(tmp_path, patch, caller_label="sca harden")
+    apply_patch_to_target(tmp_path, patch, caller_label="raptor-sca fix --harden")
     out = capsys.readouterr().out
-    assert "sca harden --apply" in out
+    assert "raptor-sca fix --harden --apply" in out

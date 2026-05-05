@@ -16,7 +16,7 @@ Inputs: ``findings.json``. Outputs (default): ``report.md`` and
 Limitation: SBOM regeneration is **not** supported. The CycloneDX
 emitter needs the resolved-dependency set (with parser confidence,
 transitive depth, etc.) which isn't fully recoverable from the row
-shape — re-run ``sca analyse`` if a fresh SBOM is needed.
+shape — re-run ``raptor-sca`` if a fresh SBOM is needed.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
 from .findings import severity_rank
 from .sarif import write_sarif
@@ -45,16 +45,16 @@ def main(argv: Sequence[str]) -> int:
 
     findings_path = Path(args.findings).resolve()
     if not findings_path.exists():
-        print(f"sca render: findings file not found: {findings_path}",
+        print(f"raptor-sca render: findings file not found: {findings_path}",
               file=sys.stderr)
         return 2
     try:
         rows = json.loads(findings_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"sca render: cannot read {findings_path}: {e}", file=sys.stderr)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"raptor-sca render: cannot read {findings_path}: {e}", file=sys.stderr)
         return 2
     if not isinstance(rows, list):
-        print(f"sca render: {findings_path} is not a finding list",
+        print(f"raptor-sca render: {findings_path} is not a finding list",
               file=sys.stderr)
         return 2
 
@@ -78,12 +78,23 @@ def main(argv: Sequence[str]) -> int:
         wrote.append(f"findings.sarif → {sarif_path}")
 
     if not wrote:
-        print("sca render: nothing to do (both --no-md and --no-sarif "
+        print("raptor-sca render: nothing to do (both --no-md and --no-sarif "
               "supplied)", file=sys.stderr)
         return 2
 
-    sys.stdout.write("sca render: wrote " + "; ".join(wrote) + "\n")
+    sys.stdout.write("raptor-sca render: wrote " + "; ".join(wrote) + "\n")
     sys.stdout.flush()
+
+    # CI-gate threshold evaluation — only fires when --fail-on-* set.
+    from .thresholds import (
+        cfg_from_args, evaluate as eval_thresholds, print_result,
+    )
+    cfg = cfg_from_args(args)
+    if cfg.is_active:
+        passed, fails = eval_thresholds(rows, cfg)
+        print_result(passed, fails, prog="raptor-sca render")
+        return 0 if passed else 1
+
     return 0
 
 
@@ -93,12 +104,12 @@ def main(argv: Sequence[str]) -> int:
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca render",
+        prog="raptor-sca render",
         description="Re-emit report.md + findings.sarif from an existing "
                     "findings.json without rerunning the network pipeline.",
     )
     p.add_argument("findings",
-                   help="path to findings.json from a prior `sca analyse` run")
+                   help="path to findings.json from a prior `raptor-sca` run")
     p.add_argument("--out-md", help="output path for the markdown report "
                                      "(default: alongside findings.json)")
     p.add_argument("--out-sarif", help="output path for findings.sarif")
@@ -109,6 +120,9 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--target",
                    help="target root used to relativise SARIF artefact URIs "
                         "(default: parent of findings.json)")
+    # CI gate flags — exit 1 if findings exceed thresholds.
+    from .thresholds import add_threshold_args
+    add_threshold_args(p)
     p.add_argument("-v", "--verbose", action="count", default=0)
     return p.parse_args(argv)
 
@@ -128,6 +142,9 @@ _SEV_LABEL = {
 
 
 def _render_markdown(rows: List[Dict[str, Any]], *, target: Path) -> str:
+    # Defensive — hand-edited findings.json may contain non-dict
+    # elements; filter them out rather than crash on `.get()`.
+    rows = [r for r in rows if isinstance(r, dict)]
     vuln_rows = [r for r in rows
                  if r.get("vuln_type") == "sca:vulnerable_dependency"]
     hygiene_rows = [r for r in rows
@@ -143,13 +160,16 @@ def _render_markdown(rows: List[Dict[str, Any]], *, target: Path) -> str:
     for r in vuln_rows:
         if r.get("suppressed"):
             continue
-        severity_counts[r.get("severity") or "info"] += 1
+        # Lowercase — LLM verdicts and hand-edited rows may capitalise
+        # ("Critical", "HIGH"); a case-sensitive counter would drop
+        # them from the summary while still surfacing them below.
+        severity_counts[(r.get("severity") or "info").lower()] += 1
         if (r.get("sca") or {}).get("in_kev"):
             kev_count += 1
 
     buf = StringIO()
     buf.write(f"# SCA Report — {target}\n\n")
-    buf.write(f"_Generated by `sca render` at "
+    buf.write(f"_Generated by `raptor-sca render` at "
               f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}_\n\n")
 
     buf.write("## Summary\n\n")
@@ -202,7 +222,7 @@ def _render_vuln_table(buf: StringIO, rows: List[Dict[str, Any]]) -> None:
             sev += " (suppressed)"
         dep = f"{sca.get('ecosystem','')}:{sca.get('name','')}@{sca.get('version','')}"
         aliases = adv.get("aliases") or []
-        adv_id = adv.get("id") if isinstance(adv, dict) else ""
+        adv_id = (adv.get("id") if isinstance(adv, dict) else "") or ""
         adv_label = adv_id + (
             f" ({aliases[0]})" if aliases else ""
         )

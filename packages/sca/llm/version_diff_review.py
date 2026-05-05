@@ -1,6 +1,6 @@
 """LLM review of version-to-version source diffs.
 
-When a dependency's version changes between ``/sca`` runs (compared
+When a dependency's version changes between ``raptor-sca`` runs (compared
 against a previous ``dependencies.json``), this stage:
 
 1. Downloads both versions' source archives from the registry.
@@ -22,10 +22,9 @@ import difflib
 import io
 import logging
 import tarfile
-import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from core.http import HttpClient
 from ..models import Dependency

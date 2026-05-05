@@ -1,4 +1,4 @@
-"""End-to-end orchestration for ``/sca``.
+"""End-to-end orchestration for ``raptor-sca``.
 
 Runs the mechanical pipeline:
 
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RunOptions:
-    """Knobs controlling a ``/sca`` run.
+    """Knobs controlling a ``raptor-sca`` run.
 
     ``offline`` and ``no_cache`` compose: ``--offline --no-cache`` will
     refuse the network *and* refuse stale cache, so the run reports
@@ -132,7 +132,7 @@ class RunOptions:
 
 @dataclass
 class RunResult:
-    """Summary of a completed ``/sca`` run."""
+    """Summary of a completed ``raptor-sca`` run."""
 
     target: Path
     output_dir: Path
@@ -722,6 +722,7 @@ def _run_triage(
     else:
         rows = []
 
+    rows = [r for r in rows if isinstance(r, dict)]
     sca_rows = [r for r in rows if r.get("vuln_type", "").startswith("sca:")]
     cross_rows = [r for r in rows if not r.get("vuln_type", "").startswith("sca:")]
 

@@ -1,4 +1,4 @@
-"""Operator-managed suppression overlay for ``/sca`` findings.
+"""Operator-managed suppression overlay for ``raptor-sca`` findings.
 
 A project ships ``.raptor-sca-suppress.yml`` at its root. Every entry is a
 matcher that flips ``suppressed=True`` (and records a reason) on findings

@@ -1,7 +1,7 @@
 """CISA Known-Exploited Vulnerabilities (KEV) lookup.
 
 The full KEV catalog is one ~150 KB JSON document fetched from CISA. We
-download it once per ``/sca`` run (24h cache), build an in-memory set
+download it once per ``raptor-sca`` run (24h cache), build an in-memory set
 of exploited CVE IDs, and answer ``contains(cve_id)`` in O(1).
 
 Failure modes:

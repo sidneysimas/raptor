@@ -1,4 +1,4 @@
-"""SARIF 2.1.0 emitter for ``/sca`` findings.
+"""SARIF 2.1.0 emitter for ``raptor-sca`` findings.
 
 GitHub code-scanning, GitLab SAST, Sonar, and most enterprise security
 platforms consume SARIF. We emit a minimal-but-valid document that:
@@ -230,7 +230,13 @@ def _row_to_result(
     result: Dict[str, Any] = {
         "ruleId": rule_id,
         "ruleIndex": idx,            # placeholder; consumers tolerate any int
-        "level": _LEVEL_BY_SEVERITY.get(severity, "note"),
+        # Lowercase normalisation — LLM verdicts and hand-edited
+        # findings.json frequently capitalise ("Critical", "HIGH"); a
+        # case-sensitive lookup would silently demote them to "note"
+        # and defeat any CI gate that fails on SARIF level=error.
+        "level": _LEVEL_BY_SEVERITY.get(
+            (severity or "").lower(), "note",
+        ),
         "message": {"text": row.get("description") or rule_id},
         "locations": [{
             "physicalLocation": {

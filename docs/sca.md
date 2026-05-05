@@ -1,34 +1,53 @@
-# /sca — Software Composition Analysis
+# raptor-sca — Software Composition Analysis
 
 Mechanical-tier dep scanner: extract every dep from a project, match against OSV / KEV / EPSS, surface hygiene + supply-chain heuristics, propose hardening patches.
 
 ## Quick start
 
+The user-facing entry point is `bin/raptor-sca`. It strips dangerous
+env vars (LD_PRELOAD, PYTHON*, etc.) before dispatching to the Python
+implementation. Add `bin/` to `$PATH` or invoke directly.
+
 ```bash
 # Full analysis: produces findings.json, report.md, sbom.cdx.json, findings.sarif
-libexec/raptor-sca /path/to/project
+bin/raptor-sca /path/to/project
 
-# Pin every loose dep to the latest safe version
-libexec/raptor-sca harden /path/to/project --git-patch
-cd /path/to/project && git apply <out-dir>/upgrade.patch
+# Show fix plan (safe default — no files modified)
+bin/raptor-sca fix /path/to/project
 
-# CI gate: exit 1 if any dep could be hardened
-libexec/raptor-sca harden /path/to/project --check
+# Apply fixes in-place
+bin/raptor-sca fix /path/to/project --apply
+
+# Upgrade all deps to latest safe version
+bin/raptor-sca fix /path/to/project --apply --harden
+
+# CI gate: exit 1 if findings above threshold
+bin/raptor-sca /path/to/project --skip-review --skip-triage \
+    --fail-on-severity high --fail-on-kev
+
+# CI gate against an existing findings.json (no re-scan)
+bin/raptor-sca render /path/to/findings.json \
+    --fail-on-severity high --fail-on-kev
 ```
+
+> **Note** — `libexec/raptor-sca-run` is the internal dispatch script.
+> It refuses to run unless invoked via `bin/raptor-sca`, the RAPTOR
+> launcher, or Claude Code. If you need to call it directly (e.g.,
+> custom CI), set `_RAPTOR_TRUSTED=1` in the environment and ensure
+> your env is otherwise clean.
 
 ## Sub-commands
 
 | Sub-command | Purpose |
 |---|---|
-| `analyse` (default) | Walk the target, match every dep against OSV/KEV/EPSS, write findings.json + report.md + sbom.cdx.json + findings.sarif |
-| `harden` | Pin loose deps to the latest *safe* version; KEV / CVSS / EPSS-aware ranking |
-| `update` | Reactive: bump only deps that have a current CVE finding |
-| `whatif` | "What would change if I bumped X to Y?" |
-| `review` | Single-dep lookup |
-| `diff` | Compare two findings.json files |
-| `verify` | Round-trip check on a findings file |
-| `render` | Re-render a findings file as report.md |
-| `purl` | Build a purl from `(ecosystem, name, version)` |
+| `<path>` (default) | Walk the target, match every dep against OSV/KEV/EPSS, write findings.json + report.md + sbom.cdx.json + findings.sarif |
+| `fix <path>` | Pin loose deps + fix CVEs; safe plan by default, `--apply` to modify. Flags: `--cve-only`, `--harden`, `--allow-major`, `--no-llm` |
+| `check <eco> <name> <ver>` | Single-dep pre-install safety verdict (Clean / Review / Block) |
+| `upgrade <eco> <name> <from> <to>` | Forward-looking upgrade impact: advisories resolved vs introduced |
+| `diff <a.json> <b.json>` | Compare two findings.json files |
+| `verify <path> --proposed <dir>` | Round-trip check: re-scan with proposed overlay applied |
+| `render <findings.json>` | Re-render report.md / SARIF from an existing findings file |
+| `purl <eco> <name> <ver>` | Build a canonical Package URL |
 | `health` | Probe every registry client; report reachability |
 
 ## What gets scanned
@@ -65,14 +84,13 @@ Every analyse run produces:
 | `sbom.cdx.json` | CycloneDX 1.5 + VEX | SBOM consumers, dependency-track, etc. |
 | `findings.sarif` | SARIF 2.1.0 | GitHub / GitLab / IDE integrations |
 
-`harden` adds:
+`fix` adds:
 
 | File | Format | Audience |
 |---|---|---|
-| `candidates.json` | structured plan | `--self-test` + a future LLM impact-analysis tier (LLM impact analysis) |
-| `report.md` | human-readable | operators |
-| `proposed/` | rewritten manifest copies | `git apply` source |
-| `upgrade.patch` | git-applyable unified diff | operator / CI |
+| `changes.json` | structured change record | tooling, CI |
+| `changes.md` | human-readable change log | operators |
+| `proposed/` | rewritten manifest copies | review, then `cp` or `git apply` |
 
 ## Data sources
 
@@ -81,9 +99,9 @@ Every analyse run produces:
 | OSV.dev (`/v1/query`, `/v1/vulns/<id>`) | advisory + affected ranges | 24h disk |
 | CISA KEV catalogue | known-exploited filter | 24h disk |
 | FIRST.org EPSS | exploitation probability | 24h disk |
-| Per-ecosystem registries | version listing for harden | 24h disk |
+| Per-ecosystem registries | version listing for fix | 24h disk |
 
-Registries supported by harden: PyPI, npm, crates.io, RubyGems, Go (proxy.golang.org), Maven Central, Packagist, NuGet, Debian Sources, Homebrew. Run `sca health` to probe all ten in one shot.
+Registries supported: PyPI, npm, crates.io, RubyGems, Go (proxy.golang.org), Maven Central, Packagist, NuGet, Debian Sources, Homebrew. Run `raptor-sca health` to probe all ten in one shot.
 
 ## Common flags
 
@@ -98,80 +116,57 @@ Registries supported by harden: PyPI, npm, crates.io, RubyGems, Go (proxy.golang
 --offline                 skip network; cache-only
 ```
 
-### harden
+### fix
 
 ```
---allow-major             bump deps that cross a major-version boundary
---allow-major-without-review  apply major bumps without LLM review (dangerous)
---allow-degraded          apply best-effort candidates (residual advisories)
---pin-only                only bump already-exact-pinned deps; don't tighten loose pins
---ecosystems PyPI,npm     allowlist; other ecosystems planned but not patched
---check                   exit 0 if no actionable candidates, 1 otherwise (CI gate)
---git-patch               write upgrade.patch
---apply                   apply the patch directly via `git apply` (refuses if not a git repo)
---self-test               apply to a temp clone, re-plan, assert idempotency
---offline                 cache-only
+--apply                   apply changes directly to manifest files
+--out <dir>               write rewritten manifests to a separate directory
+--cve-only                only fix CVEs — don't tighten loose pins
+--harden                  upgrade all deps to the latest safe version
+--allow-major             include fixes that cross a major version boundary
+--no-llm                  skip LLM analysis (mechanical-only, fast, CI-safe)
+--findings <path>         reuse findings from a previous scan
 ```
 
-## Status semantics
+## LLM auto-detection
 
-`harden` classifies each candidate into one of:
-
-| Status | Meaning |
-|---|---|
-| `promoted` | clean upgrade; goes into the patch by default |
-| `degraded_safety` | no fully-clean version exists; picked the least-worst by `(any_in_kev, max_severity, max_epss, count)` — gated behind `--allow-degraded` |
-| `up_to_date` | dep is already at the latest safe in its range |
-| `review_required` | bump exists but crosses a major boundary; gated behind `--allow-major-without-review` (or wait for LLM impact analysis — a future LLM impact-analysis tier) |
-| `skipped_loose_pin` | `--pin-only` set + dep is `>=`/`^`/`~` pinned |
-| `unsupported_manifest` | the file shape has no rewriter (rare today; only go.mod, Cargo.toml-like cases) |
-| `no_versions` | registry returned no versions (404 or genuinely unknown package) |
-| `registry_unsupported` | ecosystem has no registry client yet |
-| `needs_network` | `--offline` and no cached versions |
-
-## Severity-aware ranking (degraded_safety)
-
-When no fully-clean version exists, harden picks the *least worst* candidate by these keys, in priority order:
-
-1. **`any_in_kev`** — KEV-listed advisories are actively exploited; their presence outranks every other signal.
-2. **`max_severity`** — highest CVSS severity ordinal (none/low/medium/high/critical) across the candidate's residual advisories.
-3. **`max_epss`** — exploitation probability per FIRST.org. Within the same severity tier, lower EPSS wins.
-4. **Advisory count** — fewer is better.
-5. **Newest** — input order; final tiebreaker.
-
-A version with one critical RCE outranks a version with three mediums. A version with a KEV-listed CVE outranks any non-KEV candidate regardless of CVSS / EPSS.
+When an LLM provider is configured, `fix --allow-major` automatically analyses
+major-version-bump CVEs against your project's actual call sites. If the LLM
+judges the bump safe, it's included in the plan. If breaking changes are found,
+the output shows what breaks and where. In CI (no LLM), `fix` falls back to
+mechanical mode — warns about major bumps and exits non-zero so the pipeline
+can flag them. Use `--no-llm` to force mechanical-only mode regardless.
 
 ## CI patterns
 
-### Hard gate: no actionable hardening
+### Hard gate: severity threshold
 
 ```yaml
-- run: libexec/raptor-sca harden $PROJECT --check --ecosystems PyPI,npm
-  # exits 1 if any PyPI/npm dep could be bumped
+- run: bin/raptor-sca $PROJECT --skip-review --skip-triage \
+       --fail-on-severity high --fail-on-kev
+  # exits 1 if any finding above threshold or KEV-listed
 ```
 
 ### Soft gate: track over time
 
 ```yaml
 - run: |
-    libexec/raptor-sca $PROJECT --out before-${{github.sha}}
-    libexec/raptor-sca harden $PROJECT --apply
-    libexec/raptor-sca $PROJECT --out after-${{github.sha}}
-    libexec/raptor-sca diff before-*/findings.json after-*/findings.json
+    bin/raptor-sca $PROJECT --out before-${{github.sha}}
+    bin/raptor-sca fix $PROJECT --apply
+    bin/raptor-sca $PROJECT --out after-${{github.sha}}
+    bin/raptor-sca diff before-*/findings.json after-*/findings.json
 ```
 
 ### Pre-flight: registries reachable
 
 ```yaml
-- run: libexec/raptor-sca health
+- run: bin/raptor-sca health
   # exits 1 if any registry is unreachable; useful behind a corporate proxy
 ```
 
 ## Limitations + follow-ups
 
-- **No LLM tier (Tier B)** — typosquat-by-extrapolation, postinstall LLM review, maintainer-trust review, and upgrade impact analysis are deferred to Follow-ups #6 (inline-install LLM review) and #7 (upgrade impact analysis).
 - **Sandboxing** — registry HTTP calls go through `packages/sca/http.py` directly today. The sandbox seam will be retrofitted once `core/sandbox/` lands.
 - **Recent-publish + maintainer-change supply-chain checks** — need extra registry metadata (publish dates, maintainer lists). Deferred until sandbox lands.
 - **Variable-expanded inline installs** (`PKG="x=1"; apt install $PKG`) — would need a mini shell interpreter; deferred to a future LLM tier.
-- **`update --apply`** — `update` outputs a patch but doesn't auto-apply (unlike `harden`). Would mirror harden's flag.
 - **Maven `mvn install:install-file`** — not yet rewritable; rare in inline contexts.

@@ -3,7 +3,7 @@
 Some upgrade plans only resolve cleanly when *additional* deps bump too —
 "cascade resolution." The mechanical layer can't fully solve that; only
 the language's own package manager can. This package wraps each
-ecosystem's resolver in a uniform Protocol so ``/sca update`` can
+ecosystem's resolver in a uniform Protocol so ``raptor-sca fix`` can
 validate proposed plans without re-implementing dep resolution.
 
 Each resolver takes a project directory (containing the proposed

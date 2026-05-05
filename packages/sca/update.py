@@ -1,4 +1,4 @@
-"""``/sca update`` — CVE-driven upgrade planner.
+"""``raptor-sca fix --cve-only`` — CVE-driven upgrade planner.
 
 Reads a ``findings.json`` (or runs the analyse pipeline) and emits a
 ``proposed/`` directory of manifest rewrites that bump every vulnerable
@@ -73,7 +73,12 @@ def main(argv: Sequence[str]) -> int:
         return 2
 
     out_dir = _resolve_out_dir(args)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"raptor-sca fix --cve-only: cannot create output dir {out_dir}: {e}",
+              file=sys.stderr)
+        return 2
 
     advisory_filter = _parse_advisory_filter(args.fix)
     targets = _plan_targets(
@@ -82,7 +87,7 @@ def main(argv: Sequence[str]) -> int:
         allow_major=args.allow_major,
     )
     if not targets:
-        print("sca update: no actionable upgrades — every vulnerable dep is "
+        print("raptor-sca fix: no actionable upgrades — every vulnerable dep is "
               "either unfixed, already at the highest fix, or filtered out by "
               "--fix.", file=sys.stderr)
         return 0
@@ -115,11 +120,11 @@ def main(argv: Sequence[str]) -> int:
         patch_path, repo_root = _emit_git_patch(applied, out_dir)
         if patch_path is not None:
             extra = (
-                f"\nsca update: upgrade.patch written to {patch_path}\n"
+                f"\nraptor-sca fix: upgrade.patch written to {patch_path}\n"
                 f"          apply with: cd {repo_root} && "
                 f"git apply {patch_path}"
             )
-    print(f"sca update: {len(applied)} change(s) applied, "
+    print(f"raptor-sca fix: {len(applied)} change(s) applied, "
           f"{len(skipped)} skipped — proposed/ written to {out_dir}/proposed"
           + extra)
 
@@ -131,7 +136,7 @@ def main(argv: Sequence[str]) -> int:
         rc = apply_patch_to_target(
             repo_root if repo_root else Path.cwd(),
             patch_path,
-            caller_label="sca update",
+            caller_label="raptor-sca fix --cve-only",
         )
         if rc != 0:
             return rc
@@ -174,7 +179,7 @@ def main(argv: Sequence[str]) -> int:
             common = _common_target(files)
             target_dir = common
         if target_dir is None:
-            print("sca update: --hash-pin needs a target directory; "
+            print("raptor-sca fix: --hash-pin needs a target directory; "
                   "rerun with --target <repo>", file=sys.stderr)
         else:
             result = hash_pin_workflows(
@@ -198,7 +203,7 @@ def main(argv: Sequence[str]) -> int:
                 encoding="utf-8",
             )
             verb = "rewrote" if args.hash_pin_write else "would rewrite"
-            print(f"sca update --hash-pin: {verb} {len(result.changes)} "
+            print(f"raptor-sca fix --cve-only --hash-pin: {verb} {len(result.changes)} "
                   f"ref(s) across {len(result.changed_files)} workflow file"
                   f"(s); {len(result.skipped)} skipped. Plan: "
                   f"{out_dir}/hash-pin.json")
@@ -262,7 +267,7 @@ def _run_cascade_validation(
     )
     oks = sum(1 for s in summary if s["verdict"] == "ok")
     conflicts = sum(1 for s in summary if s["verdict"] == "conflict")
-    print(f"sca update --allow-cascade: {oks} ecosystem(s) resolve "
+    print(f"raptor-sca fix --cve-only --allow-cascade: {oks} ecosystem(s) resolve "
           f"cleanly; {conflicts} have conflicts. Plan: "
           f"{out_dir}/cascade.json")
 
@@ -274,17 +279,17 @@ def _run_external_validation(manifest: Path, out_dir: Path) -> None:
     from .resolvers import get_resolver
     eco = _detect_ecosystem_from_filename(manifest.name)
     if eco is None:
-        print(f"sca update --validate-against: cannot detect ecosystem from "
+        print(f"raptor-sca fix --cve-only --validate-against: cannot detect ecosystem from "
               f"{manifest.name!r}; supported names: package.json, "
               f"requirements.txt, go.mod, Cargo.toml, ...", file=sys.stderr)
         return
     resolver = get_resolver(eco, project_dir=manifest.parent)
     if resolver is None:
-        print(f"sca update --validate-against: no resolver wrapper for "
+        print(f"raptor-sca fix --cve-only --validate-against: no resolver wrapper for "
               f"{eco}", file=sys.stderr)
         return
     if not resolver.is_available():
-        print(f"sca update --validate-against: {eco} toolchain not in PATH",
+        print(f"raptor-sca fix --cve-only --validate-against: {eco} toolchain not in PATH",
               file=sys.stderr)
         return
     result = resolver.dry_run(manifest.parent)
@@ -298,7 +303,7 @@ def _run_external_validation(manifest: Path, out_dir: Path) -> None:
         encoding="utf-8",
     )
     verb = "validates" if result.success else "FAILS"
-    print(f"sca update --validate-against: {manifest.name} {verb} via "
+    print(f"raptor-sca fix --cve-only --validate-against: {manifest.name} {verb} via "
           f"{eco} resolver. Detail: {out_dir}/validate-against.json")
 
 
@@ -324,7 +329,7 @@ def _render_pr_comment(changes: List["UpgradeChange"]) -> str:
     applied = [c for c in changes if c.skipped_reason is None]
     skipped = [c for c in changes if c.skipped_reason is not None]
     out: List[str] = []
-    out.append("## /sca update — proposed plan")
+    out.append("## raptor-sca fix --cve-only — proposed plan")
     out.append("")
     out.append(f"- **{len(applied)} change(s) applied**")
     out.append(f"- {len(skipped)} skipped")
@@ -377,20 +382,20 @@ def _common_target(files: set) -> Optional[Path]:
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca update",
+        prog="raptor-sca fix --cve-only",
         description="CVE-driven upgrade planner.",
     )
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument(
         "--findings",
-        help="findings.json from a prior `sca analyse` run",
+        help="findings.json from a prior `raptor-sca` run",
     )
     g.add_argument(
         "--target",
-        help="run `sca analyse <target>` to produce findings before planning",
+        help="run `raptor-sca <target>` to produce findings before planning",
     )
     p.add_argument("--out", help="output dir for proposed/ + changes.* "
-                                 "(default: out/sca-update-<UTC>/)")
+                                 "(default: out/sca-fix-<UTC>/)")
     p.add_argument("--fix", help="comma-separated advisory IDs to fix; "
                                  "everything else is left alone")
     p.add_argument("--minimal", action="store_true", default=True,
@@ -443,6 +448,9 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--offline", action="store_true",
                    help="when --target is used, run analyse with --offline")
     p.add_argument("--cache-root", help="cache root for analyse pre-pass")
+    p.add_argument("--no-llm", action="store_true",
+                   help="(accepted for orthogonality with `fix`; "
+                        "this mode does not consult an LLM)")
     p.add_argument("-v", "--verbose", action="count", default=0)
     args = p.parse_args(argv)
     # ``--allow-cascade`` shells out to npm/pip/go which all need
@@ -467,23 +475,28 @@ def _load_findings(args: argparse.Namespace) -> Optional[List[Dict[str, Any]]]:
     if args.findings:
         path = Path(args.findings).resolve()
         if not path.exists():
-            print(f"sca update: findings file not found: {path}",
+            print(f"raptor-sca fix: findings file not found: {path}",
                   file=sys.stderr)
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"sca update: cannot read {path}: {e}", file=sys.stderr)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"raptor-sca fix: cannot read {path}: {e}", file=sys.stderr)
             return None
         if not isinstance(data, list):
-            print(f"sca update: {path} is not a finding list",
+            print(f"raptor-sca fix: {path} is not a finding list",
                   file=sys.stderr)
             return None
         return data
 
     target = Path(args.target).resolve()
+    if not target.exists():
+        print(f"raptor-sca fix --cve-only: target does not exist: {target}",
+              file=sys.stderr)
+        return None
     if not target.is_dir():
-        print(f"sca update: target not a directory: {target}", file=sys.stderr)
+        print(f"raptor-sca fix --cve-only: target is not a directory: {target}",
+              file=sys.stderr)
         return None
 
     # Run analyse internally, then read its findings.json.
@@ -664,9 +677,9 @@ def _materialise_changes(
                 # Anchor on the manifest's name so absolute paths still
                 # land somewhere sensible under proposed/.
                 rel = Path(manifest.name)
+            from ._atomic import atomic_write_text
             target = proposed_root / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text, encoding="utf-8")
+            atomic_write_text(target, text)
     return out
 
 
@@ -1424,7 +1437,7 @@ def _change_to_dict(c: UpgradeChange) -> Dict[str, Any]:
 def _render_changes_markdown(changes: Iterable[UpgradeChange]) -> str:
     applied = [c for c in changes if c.skipped_reason is None]
     skipped = [c for c in changes if c.skipped_reason is not None]
-    parts: List[str] = ["# sca update — proposed changes", ""]
+    parts: List[str] = ["# raptor-sca fix --cve-only — proposed changes", ""]
     parts.append(f"- Applied: **{len(applied)}**")
     parts.append(f"- Skipped: **{len(skipped)}**")
     parts.append("")

@@ -47,7 +47,6 @@ from .versions import pep440
 from core.json import JsonCache
 from . import SCA_CACHE_ROOT
 from .discovery import find_manifests
-from core.http import HttpClient
 from . import default_client
 from .models import Dependency, PinStyle
 from .osv import OsvClient
@@ -129,17 +128,27 @@ def main(argv: Sequence[str]) -> int:
             from core.security.cc_trust import set_trust_override
             set_trust_override(True)
         except ImportError:
-            logger.debug("sca harden: cc_trust unavailable; "
+            logger.debug("raptor-sca fix: cc_trust unavailable; "
                           "--trust-repo had no effect")
 
     target = Path(args.target).resolve()
-    if not target.exists() or not target.is_dir():
-        logger.error("sca harden: target not a directory: %s", target)
+    if not target.exists():
+        print(f"raptor-sca fix --harden: target does not exist: {target}",
+              file=sys.stderr)
+        return 2
+    if not target.is_dir():
+        print(f"raptor-sca fix --harden: target is not a directory: {target}",
+              file=sys.stderr)
         return 2
 
     out_dir = (Path(args.out).resolve() if args.out
                else _default_out_dir(target).resolve())
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"raptor-sca fix --harden: cannot create output dir {out_dir}: {e}",
+              file=sys.stderr)
+        return 2
 
     http = default_client()
     cache = (None if args.no_cache else
@@ -204,10 +213,10 @@ def main(argv: Sequence[str]) -> int:
         _write_report(out_dir / "report.md", candidates, [])
         _print_summary(candidates, [], out_dir)
         if actionable:
-            print(f"sca harden --check: {actionable} candidate(s) would be "
+            print(f"raptor-sca fix --harden --check: {actionable} candidate(s) would be "
                   f"applied; rerun without --check to apply.")
             return 1
-        print("sca harden --check: project is hardened (no actionable candidates).")
+        print("raptor-sca fix --harden --check: project is hardened (no actionable candidates).")
         return 0
 
     # Apply: turn each "promoted" candidate into an UpgradeChange.
@@ -236,7 +245,7 @@ def main(argv: Sequence[str]) -> int:
     if args.apply:
         from .patch_apply import apply_patch_to_target
         rc = apply_patch_to_target(target, patch_path,
-                                    caller_label="sca harden")
+                                    caller_label="raptor-sca fix --harden")
         if rc != 0:
             return rc
 
@@ -658,10 +667,10 @@ def _run_self_test(
     safe one (no advisories the first pass overlooked).
     """
     if patch_path is None or not patch_path.exists():
-        print("sca harden --self-test: no patch generated; nothing to test.")
+        print("raptor-sca fix --harden --self-test: no patch generated; nothing to test.")
         return 0
     if not (target / ".git").exists():
-        print(f"sca harden --self-test: target {target} is not a git "
+        print(f"raptor-sca fix --harden --self-test: target {target} is not a git "
               f"checkout; refusing (worktree-based isolation requires git).",
               file=sys.stderr)
         return 4
@@ -682,7 +691,7 @@ def _run_self_test(
             cwd=str(target), capture_output=True, text=True, timeout=30,
         )
         if stash.returncode != 0:
-            print(f"sca harden --self-test: `git stash create` failed: "
+            print(f"raptor-sca fix --harden --self-test: `git stash create` failed: "
                   f"{stash.stderr or stash.stdout}", file=sys.stderr)
             return 6
         worktree_ref = stash.stdout.strip() or "HEAD"
@@ -696,7 +705,7 @@ def _run_self_test(
             cwd=str(target), capture_output=True, text=True, timeout=120,
         )
         if proc.returncode != 0:
-            print(f"sca harden --self-test: git worktree add failed: "
+            print(f"raptor-sca fix --harden --self-test: git worktree add failed: "
                   f"{proc.stderr or proc.stdout}", file=sys.stderr)
             return 6
 
@@ -706,7 +715,7 @@ def _run_self_test(
             cwd=str(worktree), capture_output=True, text=True, timeout=60,
         )
         if proc.returncode != 0:
-            print(f"sca harden --self-test: patch application failed: "
+            print(f"raptor-sca fix --harden --self-test: patch application failed: "
                   f"{proc.stderr or proc.stdout}", file=sys.stderr)
             return 6
 
@@ -729,17 +738,17 @@ def _run_self_test(
             json.dumps([asdict(c) for c in post_candidates], indent=2),
             encoding="utf-8",
         )
-        print(f"sca harden --self-test: post-apply candidates → {post_path}")
+        print(f"raptor-sca fix --harden --self-test: post-apply candidates → {post_path}")
 
         if post_actionable > 0:
-            print(f"sca harden --self-test: REGRESSION — {post_actionable} "
+            print(f"raptor-sca fix --harden --self-test: REGRESSION — {post_actionable} "
                   f"candidate(s) still actionable after apply. The chosen "
                   f"versions may have advisories the planner missed, or "
                   f"the rewriter didn't pin every dep. Inspect "
                   f"{post_path}.", file=sys.stderr)
             return 7
 
-        print("sca harden --self-test: PASS — applying the patch closes "
+        print("raptor-sca fix --harden --self-test: PASS — applying the patch closes "
               "every actionable candidate.")
         return 0
     finally:
@@ -859,7 +868,7 @@ def _apply(
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca harden",
+        prog="raptor-sca fix --harden",
         description=("Pin loose deps to the latest *safe* version. "
                      "Mechanical mode — pairs with the LLM impact "
                      "analyser (Follow-up #7) when that lands."),
@@ -911,6 +920,9 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
                    help="bypass disk cache")
     p.add_argument("--cache-root",
                    help="override default ~/.raptor/cache/sca cache root")
+    p.add_argument("--no-llm", action="store_true",
+                   help="(accepted for orthogonality with `fix`; "
+                        "this mode does not consult an LLM)")
     p.add_argument("-v", "--verbose", action="count", default=0)
     return p.parse_args(argv)
 
@@ -938,7 +950,7 @@ def _write_report(
     for c in candidates:
         by_status.setdefault(c.status, []).append(c)
 
-    lines = ["# /sca harden report", ""]
+    lines = ["# raptor-sca fix --harden report", ""]
     lines.append(f"_Generated: "
                  f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC_")
     lines.append("")
@@ -1007,12 +1019,12 @@ def _print_summary(
     by_status: Dict[str, int] = {}
     for c in candidates:
         by_status[c.status] = by_status.get(c.status, 0) + 1
-    print(f"sca harden: {len(candidates)} deps analysed, "
+    print(f"raptor-sca fix: {len(candidates)} deps analysed, "
           f"{by_status.get('promoted', 0)} promoted, "
           f"{by_status.get('degraded_safety', 0)} degraded, "
           f"{by_status.get('review_required', 0)} need review")
-    print(f"sca harden: candidates.json   {out_dir / 'candidates.json'}")
-    print(f"sca harden: report.md         {out_dir / 'report.md'}")
+    print(f"raptor-sca fix: candidates.json   {out_dir / 'candidates.json'}")
+    print(f"raptor-sca fix: report.md         {out_dir / 'report.md'}")
 
 
 if __name__ == "__main__":

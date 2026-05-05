@@ -1,4 +1,4 @@
-"""``/sca whatif`` — forward-looking upgrade-impact analysis.
+"""``raptor-sca upgrade`` — forward-looking upgrade-impact analysis.
 
 Use case: an operator is considering ``lodash 4.17.4 → 4.17.21`` and
 wants the cost/benefit before committing. We re-run the same OSV/KEV/
@@ -6,11 +6,11 @@ EPSS lookups on both versions and emit a delta report.
 
 Two modes:
 
-    sca whatif <eco> <name> <from> <to>
+    raptor-sca upgrade <eco> <name> <from> <to>
         Pairwise comparison: advisories resolved by the upgrade vs new
         advisories introduced.
 
-    sca whatif <eco> <name> <from> --candidate v1 --candidate v2 ...
+    raptor-sca upgrade <eco> <name> <from> --candidate v1 --candidate v2 ...
         Multi-target table: rows are advisories on ``from``; columns
         are each candidate; cells indicate whether the candidate
         resolves that advisory. Useful for picking the smallest
@@ -63,6 +63,21 @@ def main(
 
     args = _parse_args(argv)
     _configure_logging(args.verbose)
+
+    # Validate the positional ecosystem (case-sensitive on OSV's side).
+    # Modal mode (--add/--remove/--from-file) parses ecosystems out of the
+    # spec entries instead, so the positional may be empty.
+    if args.ecosystem and not (args.add or args.remove or args.from_file):
+        from .ecosystems import canonicalise, known_list
+        canonical_eco = canonicalise(args.ecosystem)
+        if canonical_eco is None:
+            print(
+                f"raptor-sca upgrade: unknown ecosystem {args.ecosystem!r}; "
+                f"expected one of {known_list()}",
+                file=sys.stderr,
+            )
+            return 2
+        args.ecosystem = canonical_eco
 
     if cache is None:
         cache = JsonCache(root=Path(args.cache_root) if args.cache_root else SCA_CACHE_ROOT)
@@ -120,7 +135,7 @@ def main(
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca whatif",
+        prog="raptor-sca upgrade",
         description="Forward-looking upgrade-impact analysis.",
     )
     p.add_argument("ecosystem", nargs="?",
@@ -235,7 +250,7 @@ def _modal_report(
         try:
             entries = _json.loads(Path(from_file).read_text(encoding="utf-8"))
         except (OSError, _json.JSONDecodeError) as e:
-            return f"sca whatif --from: cannot read {from_file}: {e}\n", 2
+            return f"raptor-sca upgrade --from: cannot read {from_file}: {e}\n", 2
         if isinstance(entries, list):
             for entry in entries:
                 if not isinstance(entry, dict):
@@ -251,7 +266,7 @@ def _modal_report(
                 elif op == "remove":
                     spec_removes.append((eco, name))
 
-    lines: List[str] = ["# /sca whatif — proposed change set", ""]
+    lines: List[str] = ["# raptor-sca upgrade — proposed change set", ""]
 
     if spec_adds:
         lines.append("## Adds")
@@ -385,7 +400,7 @@ def _pairwise_report(
                  if _canonical_id(f) in regressed_ids]
 
     buf = StringIO()
-    buf.write(f"# sca whatif — {ecosystem}:{name} "
+    buf.write(f"# raptor-sca upgrade — {ecosystem}:{name} "
               f"{from_version} → {to_version}\n\n")
     buf.write(f"- {from_version}: **{len(by_version[from_version])}** advisor"
               f"{'y' if len(by_version[from_version]) == 1 else 'ies'}\n")
@@ -441,7 +456,7 @@ def _candidates_report(
         # Nothing to compare against — still useful to emit each
         # candidate's own advisory count so the operator can compare.
         buf = StringIO()
-        buf.write(f"# sca whatif — {ecosystem}:{name} from {from_version}\n\n")
+        buf.write(f"# raptor-sca upgrade — {ecosystem}:{name} from {from_version}\n\n")
         buf.write("No advisories on the current version. Candidate "
                   "comparisons:\n\n")
         for cand in candidates:
@@ -458,7 +473,7 @@ def _candidates_report(
             resolution_table[adv_id][cand] = adv_id not in cand_ids
 
     buf = StringIO()
-    buf.write(f"# sca whatif — {ecosystem}:{name} from {from_version}\n\n")
+    buf.write(f"# raptor-sca upgrade — {ecosystem}:{name} from {from_version}\n\n")
     buf.write(f"Comparing **{len(candidates)}** candidate "
               f"{'version' if len(candidates) == 1 else 'versions'} against "
               f"**{len(base_ids)}** open advisor"
@@ -516,7 +531,7 @@ def _synthesise(ecosystem: str, name: str, version: str) -> Dependency:
         ecosystem=ecosystem,
         name=name,
         version=version,
-        declared_in=Path(f"<sca whatif: {ecosystem}:{name}@{version}>"),
+        declared_in=Path(f"<raptor-sca upgrade: {ecosystem}:{name}@{version}>"),
         scope="main",
         is_lockfile=False,
         pin_style=PinStyle.EXACT,

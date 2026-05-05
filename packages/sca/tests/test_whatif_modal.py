@@ -1,4 +1,4 @@
-"""Tests for ``sca whatif --add / --remove / --from / --candidates``."""
+"""Tests for ``raptor-sca upgrade --add / --remove / --from / --candidates``."""
 
 from __future__ import annotations
 

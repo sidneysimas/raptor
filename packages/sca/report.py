@@ -1,4 +1,4 @@
-"""Markdown report renderer for ``/sca`` runs.
+"""Markdown report renderer for ``raptor-sca`` runs.
 
 The report is the human-facing artefact: scannable summary at the top,
 full per-finding detail in the body. Operators read this on PRs;
@@ -124,11 +124,13 @@ def render_markdown_report(
 
 
 def write_markdown_report(path: Path, content: str) -> None:
-    """Atomically write ``content`` to ``path``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    """Atomically write ``content`` to ``path``.
+
+    Thin wrapper over the canonical helper so legacy callers don't
+    have to update imports.
+    """
+    from ._atomic import atomic_write_text
+    atomic_write_text(path, content)
 
 
 # ---------------------------------------------------------------------------

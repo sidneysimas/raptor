@@ -42,8 +42,8 @@ jobs:
       - name: Checkout
         # NOTE: action refs use floating tags below (`@v6`,
         # `@v7`). Per design/sca.md §1045, our own workflows should
-        # hash-pin third-party actions; ``sca update --hash-pin
-        # --hash-pin-write`` resolves these to commit SHAs in-place.
+        # hash-pin third-party actions; ``raptor-sca fix --cve-only
+        # --hash-pin --hash-pin-write`` resolves these to commit SHAs.
         # Re-running it after each minor version bump is the
         # operator's job.
         uses: actions/checkout@v6

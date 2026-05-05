@@ -1,30 +1,36 @@
-"""CLI entrypoint for ``/sca`` — analyse + sub-commands.
+"""CLI entrypoint for ``raptor-sca``.
 
-Invocation shapes:
+Commands:
 
-    python3 -m packages.sca.cli <target> [pipeline flags]
-    python3 -m packages.sca.cli analyse <target> [pipeline flags]
-    python3 -m packages.sca.cli review <eco>:<name>@<version> [flags]
-    python3 -m packages.sca.cli whatif --change <eco>:<name>=<old>:<new> ...
-    python3 -m packages.sca.cli update --findings <path> [...]
+    raptor-sca <target>                          Scan a project
+    raptor-sca fix <target>                      Scan + fix CVEs + tighten pins
+    raptor-sca fix <target> --cve-only           Fix CVEs only (no hygiene)
+    raptor-sca fix <target> --harden             Upgrade to latest safe versions
+    raptor-sca fix --findings <path>             Reuse existing scan (CVE-only)
+    raptor-sca check <eco> <name> <version>      Pre-install safety verdict
+    raptor-sca upgrade <eco> <name> <from> <to>  Upgrade impact comparison
+    raptor-sca diff <baseline> <current>         Delta between two scan runs
 
-The default subcommand is ``analyse`` so existing call sites that pass a
-target as the first positional keep working — we sniff the first arg
-against the subcommand name set; if it doesn't match, we treat it as a
-target path for the analyse path.
+Utilities:
 
-Outputs (``analyse``):
+    raptor-sca verify <target> --proposed <dir>  Confirm proposed fixes are safe
+    raptor-sca health                            Registry reachability check
+    raptor-sca purl <eco> <name> <version>       Print canonical Package URL
+    raptor-sca render <findings.json>            Re-emit report.md / SARIF
+
+The default (no subcommand) is ``scan`` — the full analyse pipeline.
+
+Outputs (scan):
 
     <out>/findings.json    canonical schema, consumed by the rest of RAPTOR
     <out>/report.md        human-readable summary
     <out>/sbom.cdx.json    CycloneDX 1.5 SBOM with VEX block
 
-Other subcommands write their own artefacts under ``<out>/`` (see each
-module).
-
 Exit codes:
     0 — subcommand completed successfully.
-    2 — invalid arguments.
+    1 — fix: major-version bumps blocked (review needed); upgrade: mixed/
+        regression; check: review needed; diff: new findings.
+    2 — invalid arguments; check: block.
     3 — unrecoverable internal error.
 """
 
@@ -41,11 +47,10 @@ from .pipeline import RunOptions, run_sca
 
 logger = logging.getLogger(__name__)
 
-# Subcommand names — see _dispatch below. ``analyse`` is the default
-# that pre-existing call sites assume; adding new names here requires
-# matching dispatch + tests.
-_SUBCOMMANDS = ("analyse", "review", "whatif", "update", "harden",
-                "diff", "verify", "render", "purl", "health")
+SUBCOMMANDS = ("fix", "check", "upgrade", "diff",
+               "verify", "health", "purl", "render",
+               "clean-cache")
+_SUBCOMMANDS = SUBCOMMANDS  # backcompat alias for internal callers
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -63,48 +68,107 @@ def _split_subcommand(argv: Sequence[str]) -> "tuple[str, List[str]]":
     """Return (subcommand, remaining_args).
 
     If the first arg matches a known subcommand it's consumed; otherwise
-    we default to ``analyse`` and leave the args alone — that's how a
-    bare ``raptor-sca <target>`` invocation routes to the analyse path.
-    A leading ``-h``/``--help`` is also treated as analyse-help so the
-    pre-existing flat help text keeps working.
+    we default to ``scan`` and leave the args alone — that's how a
+    bare ``raptor-sca <target>`` invocation routes to the scan path.
     """
     if argv and argv[0] in _SUBCOMMANDS:
         return argv[0], list(argv[1:])
-    return "analyse", list(argv)
+    return "scan", list(argv)
 
 
 def _dispatch(subcommand: str, argv: List[str]) -> int:
-    if subcommand == "analyse":
+    if subcommand == "scan":
         return _run_analyse(argv)
-    if subcommand == "review":
+    if subcommand == "fix":
+        return _dispatch_fix(argv)
+    if subcommand == "check":
         from . import review
         return review.main(argv)
-    if subcommand == "whatif":
+    if subcommand == "upgrade":
         from . import whatif
         return whatif.main(argv)
-    if subcommand == "update":
-        from . import update
-        return update.main(argv)
-    if subcommand == "harden":
-        from . import harden
-        return harden.main(argv)
-    if subcommand == "health":
-        from . import health
-        return health.main(argv)
     if subcommand == "diff":
         from . import diff
         return diff.main(argv)
     if subcommand == "verify":
         from . import verify
         return verify.main(argv)
-    if subcommand == "render":
-        from . import render
-        return render.main(argv)
+    if subcommand == "health":
+        from . import health
+        return health.main(argv)
     if subcommand == "purl":
         from . import purl
         return purl.main(argv)
-    print(f"sca: unknown subcommand {subcommand!r}", file=sys.stderr)
+    if subcommand == "render":
+        from . import render
+        return render.main(argv)
+    if subcommand == "clean-cache":
+        from . import clean_cache
+        return clean_cache.main(argv)
+    print(f"raptor-sca: unknown subcommand {subcommand!r}", file=sys.stderr)
     return 2
+
+
+def _dispatch_fix(argv: List[str]) -> int:
+    """Route ``fix`` to the right backend based on flags.
+
+    update.py (--cve-only) uses ``--target <path>`` instead of a positional
+    arg, so we translate the positional target when routing there.
+    ``--findings`` implies ``--cve-only`` since only update.py supports it.
+    """
+    has_cve_only = "--cve-only" in argv
+    has_harden = "--harden" in argv
+    has_findings = "--findings" in argv
+
+    if has_cve_only and has_harden:
+        print("raptor-sca fix: --cve-only and --harden are mutually exclusive",
+              file=sys.stderr)
+        return 2
+
+    if has_cve_only or has_findings:
+        from . import update
+        return update.main(_positional_to_target_flag(
+            [a for a in argv if a != "--cve-only"],
+        ))
+    if has_harden:
+        from . import harden
+        return harden.main([a for a in argv if a != "--harden"])
+    from . import optimise
+    return optimise.main(argv)
+
+
+def _positional_to_target_flag(argv: List[str]) -> List[str]:
+    """Convert a bare positional path to ``--target <path>`` for update.py.
+
+    update.py uses a mutually-exclusive group (``--findings`` | ``--target``)
+    instead of a positional argument, so ``fix /path --cve-only`` needs the
+    positional translated.
+
+    When ``--findings`` is already present, any bare positional is silently
+    dropped (``--findings`` takes precedence).
+    """
+    if "--target" in argv:
+        return argv
+    has_findings = "--findings" in argv
+    _VALUE_FLAGS = {"--findings", "--out", "--fix", "--target", "--cache-root"}
+    out: List[str] = []
+    expect_value = False
+    for arg in argv:
+        if expect_value:
+            out.append(arg)
+            expect_value = False
+            continue
+        if arg in _VALUE_FLAGS:
+            out.append(arg)
+            expect_value = True
+            continue
+        if not arg.startswith("-") and "--target" not in out:
+            if has_findings:
+                continue
+            out.extend(["--target", arg])
+        else:
+            out.append(arg)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +187,15 @@ def _run_analyse(argv: List[str]) -> int:
             from core.security.cc_trust import set_trust_override
             set_trust_override(True)
         except ImportError:
-            logger.debug("sca: core.security.cc_trust unavailable; "
+            logger.debug("raptor-sca: core.security.cc_trust unavailable; "
                           "--trust-repo had no effect")
 
     target = Path(args.target).resolve()
     if not target.exists():
-        logger.error("sca: target does not exist: %s", target)
+        logger.error("raptor-sca: target does not exist: %s", target)
         return 2
     if not target.is_dir():
-        logger.error("sca: target is not a directory: %s", target)
+        logger.error("raptor-sca: target is not a directory: %s", target)
         return 2
 
     output_dir = _resolve_output_dir(args.out, prefix="sca")
@@ -162,7 +226,7 @@ def _run_analyse(argv: List[str]) -> int:
     try:
         result = run_sca(target=target, output_dir=output_dir, options=options)
     except Exception:                       # noqa: BLE001
-        logger.exception("sca: unrecoverable error during run")
+        logger.exception("raptor-sca: unrecoverable error during run")
         return 3
 
     if args.baseline:
@@ -173,10 +237,33 @@ def _run_analyse(argv: List[str]) -> int:
                 output_dir=output_dir,
             )
         except Exception:                   # noqa: BLE001
-            logger.exception("sca: baseline delta computation failed")
+            logger.exception("raptor-sca: baseline delta computation failed")
             # Don't fail the run; the primary findings.json is fine.
 
     _print_summary(result)
+
+    # CI-gate threshold evaluation — only fires when --fail-on-* set.
+    from .thresholds import (
+        cfg_from_args, evaluate as eval_thresholds, print_result,
+    )
+    cfg = cfg_from_args(args)
+    if cfg.is_active:
+        import json as _json
+        try:
+            rows = _json.loads(
+                (output_dir / "findings.json").read_text(encoding="utf-8")
+            )
+        except (OSError, _json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error("raptor-sca: cannot read findings for "
+                         "threshold check: %s", e)
+            return 3
+        if not isinstance(rows, list):
+            logger.error("raptor-sca: findings.json is not a list")
+            return 3
+        passed, fails = eval_thresholds(rows, cfg)
+        print_result(passed, fails)
+        return 0 if passed else 1
+
     return 0
 
 
@@ -190,13 +277,13 @@ def _emit_baseline_delta(
     NEW/CLEARED/CHANGED set since ``baseline_path``.
 
     Reuses the existing ``diff.compute_delta`` machinery so the delta
-    semantics are consistent with the standalone ``sca diff`` command.
+    semantics are consistent with the standalone ``raptor-sca diff`` command.
     """
     import json as _json
     from .diff import compute_delta, _delta_to_dict, _render_markdown
 
     if not baseline_path.exists():
-        logger.warning("sca: baseline %s not found; skipping delta",
+        logger.warning("raptor-sca: baseline %s not found; skipping delta",
                        baseline_path)
         return
 
@@ -205,7 +292,7 @@ def _emit_baseline_delta(
     current_rows = _json.loads(
         current_findings.read_text(encoding="utf-8"))
     if not isinstance(baseline_rows, list) or not isinstance(current_rows, list):
-        logger.warning("sca: baseline/current findings.json not a list; "
+        logger.warning("raptor-sca: baseline/current findings.json not a list; "
                        "skipping delta")
         return
 
@@ -219,7 +306,7 @@ def _emit_baseline_delta(
         encoding="utf-8",
     )
     logger.info(
-        "sca: baseline delta — %d new, %d resolved, %d suppression-added, "
+        "raptor-sca: baseline delta — %d new, %d resolved, %d suppression-added, "
         "%d suppression-lifted",
         len(delta.new), len(delta.resolved),
         len(delta.suppression_added), len(delta.suppression_lifted),
@@ -228,9 +315,9 @@ def _emit_baseline_delta(
 
 def _parse_analyse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="sca analyse",
-        description="RAPTOR /sca analyse — mechanical Software Composition "
-                    "Analysis.",
+        prog="raptor-sca",
+        description="Scan a project for vulnerable dependencies, supply-chain "
+                    "red flags, and hygiene issues.",
     )
     parser.add_argument("target", help="path to the project to analyse")
     parser.add_argument(
@@ -341,6 +428,9 @@ def _parse_analyse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--cache-root",
         help="override default ~/.raptor/cache/sca cache root",
     )
+    # CI gate flags — exit 1 if findings exceed thresholds.
+    from .thresholds import add_threshold_args
+    add_threshold_args(parser)
     parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="-v INFO, -vv DEBUG (default: WARNING)",
@@ -378,36 +468,36 @@ def _print_summary(result) -> None:
     """Print a one-screen analyse-mode summary."""
     lines: List[str] = [
         "",
-        f"sca: target            {result.target}",
-        f"sca: output            {result.output_dir}",
-        f"sca: dependencies      {result.deps_analysed}",
+        f"raptor-sca: target            {result.target}",
+        f"raptor-sca: output            {result.output_dir}",
+        f"raptor-sca: dependencies      {result.deps_analysed}",
     ]
     transitive_line = _format_transitive_line(result)
     if transitive_line is not None:
         lines.append(transitive_line)
     lines.extend([
-        f"sca: vuln findings     {result.vuln_findings}",
-        f"sca: in-KEV            {result.in_kev}",
-        f"sca: supply-chain      {result.supply_chain_findings}",
-        f"sca: hygiene findings  {result.hygiene_findings}",
+        f"raptor-sca: vuln findings     {result.vuln_findings}",
+        f"raptor-sca: in-KEV            {result.in_kev}",
+        f"raptor-sca: supply-chain      {result.supply_chain_findings}",
+        f"raptor-sca: hygiene findings  {result.hygiene_findings}",
     ])
     if result.llm_reviews_run or result.llm_reviews_failed:
         lines.append(
-            f"sca: LLM reviews       {result.llm_reviews_run} enriched"
+            f"raptor-sca: LLM reviews       {result.llm_reviews_run} enriched"
             + (f", {result.llm_reviews_failed} failed"
                if result.llm_reviews_failed else ""),
         )
     if result.triage_run:
-        lines.append("sca: LLM triage        done")
+        lines.append("raptor-sca: LLM triage        done")
     if result.llm_cost > 0:
-        lines.append(f"sca: LLM cost          ${result.llm_cost:.4f}")
+        lines.append(f"raptor-sca: LLM cost          ${result.llm_cost:.4f}")
     lines.extend([
-        f"sca: cache             {result.cache_hits} hits / "
+        f"raptor-sca: cache             {result.cache_hits} hits / "
         f"{result.cache_misses} misses",
-        f"sca: findings.json     {result.findings_path}",
-        f"sca: report.md         {result.report_path}",
-        f"sca: sbom.cdx.json     {result.sbom_path}",
-        f"sca: findings.sarif    {result.sarif_path}",
+        f"raptor-sca: findings.json     {result.findings_path}",
+        f"raptor-sca: report.md         {result.report_path}",
+        f"raptor-sca: sbom.cdx.json     {result.sbom_path}",
+        f"raptor-sca: findings.sarif    {result.sarif_path}",
         "",
     ])
     sys.stdout.write("\n".join(lines))
@@ -426,7 +516,7 @@ def _format_transitive_line(result) -> Optional[str]:
         # Highlight the win — operator can see we expanded coverage.
         n_eco = len({s.ecosystem for s in statuses
                      if s.method in ("cascade_resolver", "metadata_walk")})
-        return (f"sca: transitive        +{result.transitive_added} dep(s) "
+        return (f"raptor-sca: transitive        +{result.transitive_added} dep(s) "
                 f"across {n_eco} ecosystem(s)")
     # Nothing was added — surface the most-informative skip reason so
     # operators see why coverage is incomplete. Prefer "toolchain
@@ -448,7 +538,7 @@ def _format_transitive_line(result) -> Optional[str]:
     # Collapse whitespace so the summary stays one line and reads
     # cleanly alongside the rest of the run output.
     collapsed = " ".join(top_reason.split())
-    return (f"sca: transitive        skipped — {collapsed[:90]} "
+    return (f"raptor-sca: transitive        skipped — {collapsed[:90]} "
             f"({eco_list})")
 
 

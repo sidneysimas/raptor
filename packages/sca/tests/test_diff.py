@@ -154,7 +154,7 @@ def test_main_writes_markdown_by_default(tmp_path: Path, capsys) -> None:
     rc = diff.main([str(a), str(b)])
     assert rc == 1   # B introduces a critical → above default --severity high
     out = capsys.readouterr().out
-    assert "# sca diff" in out
+    assert "# raptor-sca diff" in out
     assert "## New findings" in out
     assert "lodash" in out
 
@@ -192,7 +192,7 @@ def test_exit_code_zero_when_new_below_severity_threshold(
 ) -> None:
     a = _write(tmp_path, "a.json", [])
     b = _write(tmp_path, "b.json", [_vuln_row(severity="medium")])
-    rc = diff.main([str(a), str(b), "--severity", "high"])
+    rc = diff.main([str(a), str(b), "--fail-on-severity", "high"])
     assert rc == 0
 
 

@@ -1,6 +1,6 @@
 """Registry health check sub-command.
 
-``sca health`` pings every registry client against a known-good package
+``raptor-sca health`` pings every registry client against a known-good package
 and reports per-ecosystem reachability. Useful for:
 
 - Pre-flight diagnostics (operator hits "all hardens fail" — was it the
@@ -115,7 +115,7 @@ def _print_table(results: List[_ProbeResult]) -> None:
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca health",
+        prog="raptor-sca health",
         description="Probe every registry client against a known package; "
                     "report reachability + latency. Returns non-zero if "
                     "any registry fails.",

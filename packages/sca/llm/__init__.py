@@ -1,4 +1,4 @@
-"""LLM-assisted analysis stages for ``/sca``.
+"""LLM-assisted analysis stages for ``raptor-sca``.
 
 Shared infrastructure that every LLM stage uses:
 

@@ -1,4 +1,4 @@
-"""``/sca`` ↔ ``/understand`` integration — read the ``context-map.json``
+"""``raptor-sca`` ↔ ``/understand`` integration — read the ``context-map.json``
 written by an earlier ``/understand --map`` run and use it to enrich
 reachability evidence.
 

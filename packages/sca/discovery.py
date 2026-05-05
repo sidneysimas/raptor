@@ -63,6 +63,7 @@ EXCLUDED_DIR_NAMES: Set[str] = {
     ".nuxt",
     ".cache",
     ".turbo",
+    ".claude",         # Claude Code agent worktrees + ephemeral state
 }
 
 # Filenames that hint a directory is dependency-related junk we should

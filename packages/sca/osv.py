@@ -97,7 +97,7 @@ class OsvResult:
 class OsvClient:
     """Thin OSV.dev client with caching.
 
-    Construct one per ``/sca`` run and pass to ``query_batch``. Wraps
+    Construct one per ``raptor-sca`` run and pass to ``query_batch``. Wraps
     :class:`packages.osv.OsvClient` with the SCA-specific per-query
     cache layer (``Dependency.key()`` keyed), chunking, and offline-DB
     fallback.

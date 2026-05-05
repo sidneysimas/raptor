@@ -1,5 +1,5 @@
 ---
-description: Software Composition Analysis — find vulnerable dependencies, gate CI, plan upgrades
+description: Software Composition Analysis — find vulnerable dependencies, gate CI, fix and pin
 ---
 
 # RAPTOR Software Composition Analysis
@@ -11,16 +11,17 @@ You are helping the user analyse a project's third-party dependencies for known 
 1. **Identify the target**: Ask which directory/repository to scan if not specified.
 
 2. **Pick the right sub-command**:
-   - **Default — analyse the whole project**: `libexec/raptor-sca <target>`
+   - **Default — analyse the whole project**: `libexec/raptor-sca-run <target>`
      Walks every manifest+lockfile, queries OSV/KEV/EPSS, runs reachability + supply-chain + hygiene checks, emits `findings.json`, `report.md`, and `sbom.cdx.json`.
-   - **Pre-add evaluation of one package**: `libexec/raptor-sca review <ecosystem> <name> <version>`
+   - **Fix vulnerabilities and tighten pins**: `libexec/raptor-sca-run fix <target>`
+     Shows a plan (safe default). Use `--apply` to modify manifests in place.
+     Use `--cve-only` to fix only CVEs, `--harden` to upgrade all deps to latest safe versions.
+   - **Pre-add evaluation of one package**: `libexec/raptor-sca-run check <ecosystem> <name> <version>`
      Quick verdict (Clean / Review / Block) before `npm install` / `pip install`.
-   - **Forward-looking upgrade impact**: `libexec/raptor-sca whatif <ecosystem> <name> <from> <to>`
+   - **Forward-looking upgrade impact**: `libexec/raptor-sca-run upgrade <ecosystem> <name> <from> <to>`
      What an upgrade resolves vs introduces; supports `--candidate` for multi-target tables.
-   - **Auto-generate upgrade patches**: `libexec/raptor-sca update --findings <out>/findings.json [--allow-major]`
-     Reads a previous run's findings and writes a `proposed/` directory of rewritten manifests.
-   - **CI / pre-commit gate**: `libexec/raptor-sca-gate <target> --severity high --fail-on-kev`
-     Mechanical-only fast path; exits 0/1 by threshold for build hooks.
+   - **CI / pre-commit gate**: `libexec/raptor-sca-run <target> --skip-review --skip-triage --fail-on-severity high --fail-on-kev`
+     Mechanical-only path; exits 0/1 by threshold for build hooks.
 
 3. **Analyse results**:
    - Read `<out>/report.md` for a human-readable severity-sorted view.
@@ -29,7 +30,7 @@ You are helping the user analyse a project's third-party dependencies for known 
    - Surface critical and KEV-listed CVEs first; the report orders them that way.
 
 4. **Help apply fixes**:
-   - Run `update` to generate `proposed/` rewrites.
+   - Run `fix` to generate `proposed/` rewrites (or `--apply` for in-place).
    - Show the diff (`git diff proposed/`) so the operator can review before applying.
    - Note which deps got skipped and why (Maven property references, npm git URLs, etc.).
 
@@ -37,39 +38,63 @@ You are helping the user analyse a project's third-party dependencies for known 
 
 Full analyse:
 ```bash
-libexec/raptor-sca /path/to/project
+libexec/raptor-sca-run /path/to/project
+```
+
+Fix plan (safe default — no files modified):
+```bash
+libexec/raptor-sca-run fix /path/to/project
+```
+
+Apply fixes in-place:
+```bash
+libexec/raptor-sca-run fix /path/to/project --apply
+```
+
+Fix CVEs only (don't tighten loose pins):
+```bash
+libexec/raptor-sca-run fix /path/to/project --apply --cve-only
+```
+
+Upgrade all deps to latest safe versions:
+```bash
+libexec/raptor-sca-run fix /path/to/project --apply --harden
+```
+
+Allow major-version bumps (with LLM impact analysis when available):
+```bash
+libexec/raptor-sca-run fix /path/to/project --apply --allow-major
+```
+
+Skip LLM analysis (mechanical-only, fast, CI-safe):
+```bash
+libexec/raptor-sca-run fix /path/to/project --no-llm
 ```
 
 CI gate that fails on any KEV-listed CVE or high-severity finding:
 ```bash
-libexec/raptor-sca-gate /path/to/project --severity high --fail-on-kev
+libexec/raptor-sca-run /path/to/project \
+    --skip-review --skip-triage \
+    --fail-on-severity high --fail-on-kev
 ```
 
-Pre-add review:
+Pre-add check:
 ```bash
-libexec/raptor-sca review npm lodash 4.17.21
-libexec/raptor-sca review PyPI django 4.2.10
-libexec/raptor-sca review Maven org.springframework:spring-core 6.1.0
+libexec/raptor-sca-run check npm lodash 4.17.21
+libexec/raptor-sca-run check PyPI django 4.2.10
+libexec/raptor-sca-run check Maven org.springframework:spring-core 6.1.0
 ```
 
 Upgrade impact comparison:
 ```bash
-libexec/raptor-sca whatif npm lodash 4.17.4 4.17.21
-libexec/raptor-sca whatif npm lodash 4.17.4 \
+libexec/raptor-sca-run upgrade npm lodash 4.17.4 4.17.21
+libexec/raptor-sca-run upgrade npm lodash 4.17.4 \
     --candidate 4.17.10 --candidate 4.17.21 --candidate 4.18.0
-```
-
-Plan upgrades from a previous run:
-```bash
-libexec/raptor-sca /path/to/project --out /tmp/sca-run
-libexec/raptor-sca update --findings /tmp/sca-run/findings.json \
-    --out /tmp/sca-update --allow-major
-git diff --no-index /path/to/project /tmp/sca-update/proposed
 ```
 
 Offline mode (cache only — useful in CI when egress is restricted):
 ```bash
-libexec/raptor-sca /path/to/project --offline
+libexec/raptor-sca-run /path/to/project --offline
 ```
 
 ## Outputs
@@ -80,8 +105,8 @@ libexec/raptor-sca /path/to/project --offline
 | `report.md` | Severity-sorted markdown | humans |
 | `sbom.cdx.json` | CycloneDX 1.5 + VEX | Dependency-Track, CycloneDX CLI |
 | `coverage-sca.json` | Files examined | RAPTOR coverage layer |
-| `proposed/` (update) | Rewritten manifests | operator review then `git apply` |
-| `changes.json` / `changes.md` (update) | Per-change record | review |
+| `proposed/` (fix --out) | Rewritten manifest files | operator review then `git apply` |
+| `changes.json` / `changes.md` (fix) | Per-change record | review |
 
 ## Important notes
 
@@ -91,10 +116,12 @@ libexec/raptor-sca /path/to/project --offline
 - KEV (CISA known-exploited) and EPSS (FIRST.org probability) are always checked when network is available; both degrade gracefully on outage.
 - Reachability is **module-level** (Python AST + npm import sweep) — flags whether the dep is imported in non-test code, not whether the vulnerable function is called.
 - All optional dependencies (`defusedxml`, `packaging`, `tomli` on 3.10-, `PyYAML`) degrade gracefully — missing one only narrows ecosystem coverage.
+- **LLM auto-detection:** When an LLM provider is configured, `fix --allow-major` automatically analyses major-version-bump CVEs against your project's actual call sites. Safe bumps are included; breaking changes show migration guidance. Use `--no-llm` to force mechanical-only mode.
 
 ## Exit codes
 
 - Analyse / sub-commands: 0 success, 2 invalid args, 3 internal error.
-- Gate (`raptor-sca-gate`): 0 below threshold, 1 above threshold (build-fail).
-- Review: 0 clean, 1 review-needed, 2 block.
-- Whatif: 0 net-positive trade, 1 mixed/regression.
+- Scan with `--fail-on-severity` / `--fail-on-kev`: 0 below threshold, 1 above threshold (build-fail).
+- Check: 0 clean, 1 review-needed, 2 block.
+- Upgrade: 0 net-positive trade, 1 mixed/regression.
+- Fix: 0 success, 1 major-version bumps blocked (review needed), 2 invalid args, 3 internal error.

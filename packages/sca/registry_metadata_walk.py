@@ -23,7 +23,7 @@ Consequences:
 
 For accuracy use mode (b) (cascade resolver in sandbox) instead.
 This module is the fallback when the toolchain isn't available, and
-the natural mode for ``/sca review <pkg@ver>`` pre-installation
+the natural mode for ``raptor-sca check <pkg@ver>`` pre-installation
 analysis where there's no project to resolve against.
 
 Supported ecosystems today: PyPI, npm, crates.io. Other ecosystems
@@ -470,6 +470,8 @@ def _fetch_crates(
     deps = data.get("dependencies") or []
     out: List[Tuple[str, str]] = []
     for entry in deps:
+        if not isinstance(entry, dict):
+            continue  # poisoned/MITM'd cache entry — skip
         if entry.get("kind") and entry.get("kind") != "normal":
             continue
         if entry.get("optional"):
@@ -493,9 +495,50 @@ def supported_ecosystems() -> Set[str]:
     return set(_FETCHERS)
 
 
+_EXISTENCE_URLS = {
+    "PyPI": "https://pypi.org/pypi/{name}/{version}/json",
+    "npm": "https://registry.npmjs.org/{name}/{version}",
+    "crates.io": "https://crates.io/api/v1/crates/{name}/{version}",
+}
+
+
+def package_version_exists(
+    ecosystem: str, name: str, version: str,
+    *, http: HttpClient, cache: Optional[JsonCache] = None,
+) -> Optional[bool]:
+    """Probe whether ``(ecosystem, name, version)`` exists in its registry.
+
+    Returns:
+        True  — registry returned metadata.
+        False — registry returned 404 / not-found.
+        None  — couldn't tell (no probe URL, network error, parse fail).
+
+    Used by ``raptor-sca check`` to escalate the verdict from Clean to
+    Review when the registry can't confirm the package exists. Calls
+    the registry directly rather than going through the transitive
+    fetcher (which swallows 404), so 404 vs network-error is
+    distinguishable.
+    """
+    url_tmpl = _EXISTENCE_URLS.get(ecosystem)
+    if url_tmpl is None:
+        return None
+    url = url_tmpl.format(name=name, version=version)
+    try:
+        http.get_json(url, retries=0)
+    except HttpError as e:
+        # ``HttpError`` exposes ``.status`` for the HTTP status code.
+        if getattr(e, "status", None) == 404:
+            return False
+        return None
+    except Exception:                               # noqa: BLE001
+        return None
+    return True
+
+
 __all__ = [
     "DEFAULT_MAX_DEPTH",
     "WalkResult",
+    "package_version_exists",
     "supported_ecosystems",
     "walk_transitive",
 ]

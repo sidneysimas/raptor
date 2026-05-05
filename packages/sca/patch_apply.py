@@ -1,6 +1,6 @@
 """Apply a generated upgrade patch to the operator's tree.
 
-Shared by ``/sca harden --apply`` and ``/sca update --apply``. Both
+Shared by ``raptor-sca fix --harden --apply`` and ``raptor-sca fix --cve-only --apply``. Both
 emit a git-flavoured unified diff during their respective plan
 phases; this module is the small "actually run ``git apply``" step
 that comes after.
@@ -38,8 +38,8 @@ def apply_patch_to_target(
         patch_path: path to the unified diff. ``None`` is a graceful
             no-op (some plan paths produce nothing patchable, which
             isn't an error).
-        caller_label: subcommand prefix for log lines (``"sca harden"``
-            or ``"sca update"``); helps operators read CI output.
+        caller_label: subcommand prefix for log lines (``"raptor-sca fix --harden"``
+            or ``"raptor-sca fix --cve-only"``); helps operators read CI output.
         timeout: ``git apply`` timeout in seconds.
 
     Returns:

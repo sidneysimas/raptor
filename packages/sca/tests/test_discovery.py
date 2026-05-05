@@ -44,3 +44,21 @@ def test_node_modules_still_excluded(tmp_path: Path) -> None:
 def test_packages_not_in_excludes() -> None:
     """Belt-and-braces: bare 'packages' must not be in EXCLUDED_DIR_NAMES."""
     assert "packages" not in EXCLUDED_DIR_NAMES
+
+
+def test_claude_dir_excluded() -> None:
+    """.claude/ contains agent worktrees — must not be scanned."""
+    assert ".claude" in EXCLUDED_DIR_NAMES
+
+
+def test_claude_worktrees_skipped(tmp_path: Path) -> None:
+    """Manifests inside .claude/worktrees/ must not be discovered."""
+    (tmp_path / ".claude" / "worktrees" / "agent-abc123").mkdir(parents=True)
+    (tmp_path / ".claude" / "worktrees" / "agent-abc123" / "requirements.txt").write_text(
+        "requests>=2.31.0\n"
+    )
+    (tmp_path / "requirements.txt").write_text("flask>=2.3.0\n")
+    manifests = find_manifests(tmp_path)
+    paths = [str(m.path) for m in manifests]
+    assert any("flask" in Path(p).read_text() for p in paths)
+    assert not any(".claude" in p for p in paths)

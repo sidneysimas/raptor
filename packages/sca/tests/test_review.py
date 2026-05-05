@@ -1,4 +1,4 @@
-"""Tests for ``packages.sca.review`` (the ``/sca review`` subcommand)."""
+"""Tests for ``packages.sca.review`` (the ``raptor-sca check`` subcommand)."""
 
 from __future__ import annotations
 
@@ -81,17 +81,131 @@ class StubHttp:
 # ---------------------------------------------------------------------------
 
 def test_clean_dep_returns_zero(tmp_path: Path, capsys) -> None:
-    """A safe version with no advisories and no typosquat → exit 0."""
+    """A safe version with no advisories and no typosquat → exit 0.
+
+    Uses ``--no-transitive`` to skip the registry-metadata walk; the
+    StubHttp doesn't model registry responses, and an unknown registry
+    URL would otherwise trigger the seed-metadata-unverifiable warning.
+    """
     http = StubHttp()
     cache = JsonCache(root=tmp_path)
     rc = review.main(
-        ["npm", "@types/node", "20.10.5", "--out", str(tmp_path / "r.md")],
+        ["npm", "@types/node", "20.10.5",
+         "--no-transitive",
+         "--out", str(tmp_path / "r.md")],
         http=http, cache=cache,
     )
     assert rc == 0
     out = capsys.readouterr().out
     assert "**Verdict:** Clean" in out
     assert "No advisories found" in out
+
+
+def test_unknown_ecosystem_returns_2(tmp_path: Path, capsys) -> None:
+    """Unrecognised ecosystem rejected before any OSV call."""
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path)
+    rc = review.main(["Bogus", "requests", "0.1.0"], http=http, cache=cache)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown ecosystem" in err
+
+
+def test_lowercase_ecosystem_canonicalised(tmp_path: Path, capsys) -> None:
+    """Lowercase ecosystem is canonicalised to the OSV-accepted form
+    so the OSV query actually returns advisories.
+    """
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path)
+    rc = review.main(
+        ["pypi", "requests", "2.31.0", "--no-transitive"],
+        http=http, cache=cache,
+    )
+    # OSV would have been called with PyPI (canonical); StubHttp returns
+    # no advisories, so verdict is Clean.
+    assert rc == 0
+    # Verify we sent PyPI (not pypi) to OSV.
+    posts = http.posts
+    assert any(
+        any(q.get("package", {}).get("ecosystem") == "PyPI"
+            for q in body.get("queries", []))
+        for _url, body in posts
+    )
+
+
+def test_seed_metadata_unverifiable_escalates_to_review(
+    tmp_path: Path, capsys,
+) -> None:
+    """When the registry can't confirm the package exists, escalate
+    an otherwise-clean verdict to Review.
+    """
+    # StubHttp with no advisories AND no registry responses → seed
+    # walk fails → seed_metadata_unverifiable=True.
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path)
+    rc = review.main(
+        ["npm", "nonexistent-package-xyz123", "1.0.0"],
+        http=http, cache=cache,
+    )
+    # Verdict escalated from Clean to Review (exit 1).
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "**Verdict:** Review" in out
+    assert "could not confirm" in out
+
+
+def test_existence_probe_runs_under_no_transitive(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    """The existence probe runs even when --no-transitive is set, so
+    nonexistent packages are still escalated to Review.
+    """
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path)
+
+    # Stub package_version_exists to return False (404), simulating a
+    # nonexistent package without needing real network.
+    from packages.sca import registry_metadata_walk
+    monkeypatch.setattr(
+        registry_metadata_walk, "package_version_exists",
+        lambda *a, **kw: False,
+    )
+    rc = review.main(
+        ["PyPI", "nonexistent-pkg-xyz", "1.0.0", "--no-transitive"],
+        http=http, cache=cache,
+    )
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "**Verdict:** Review" in out
+    assert "## Existence" in out
+    assert "could not confirm" in out
+
+
+def test_existence_probe_skipped_under_offline(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    """--offline skips the existence probe (no network available).
+    Operators get Clean for nonexistent packages in offline mode;
+    that's the documented trade-off.
+    """
+    http = StubHttp()
+    cache = JsonCache(root=tmp_path)
+
+    # The probe shouldn't be called under --offline; assert that.
+    from packages.sca import registry_metadata_walk
+    called = []
+    def _record(*a, **kw):
+        called.append(True)
+        return False
+    monkeypatch.setattr(
+        registry_metadata_walk, "package_version_exists", _record,
+    )
+    rc = review.main(
+        ["PyPI", "anything-x-y-z", "1.0.0", "--no-transitive", "--offline"],
+        http=http, cache=cache,
+    )
+    assert rc == 0
+    assert called == [], "probe should not run under --offline"
 
 
 def test_kev_listed_dep_returns_block(tmp_path: Path, capsys) -> None:

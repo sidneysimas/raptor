@@ -400,38 +400,66 @@ def mode_scan(args: list) -> int:
 def mode_sca(args: list) -> int:
     """Run mechanical Software Composition Analysis.
 
-    Delegates to ``libexec/raptor-sca`` which manages the run-lifecycle
+    Delegates to ``libexec/raptor-sca-run`` which manages the run-lifecycle
     metadata itself; we don't wrap with ``_run_with_lifecycle`` (which
     is shaped for the Semgrep/CodeQL/AFL++ external-tool workflow).
     """
     script_root = Path(__file__).parent
-    sca_shim = script_root / "libexec" / "raptor-sca"
+    sca_shim = script_root / "libexec" / "raptor-sca-run"
     if not sca_shim.exists():
         print(f"✗ SCA shim not found: {sca_shim}")
         return 1
 
     # Translate ``--repo <p>`` into the positional target the shim
     # expects, so ``raptor.py sca --repo /path`` matches the convention
-    # of the other modes.
+    # of the other modes. When a subcommand follows --repo (e.g.,
+    # ``raptor.py sca --repo /path fix --apply``), the path must be
+    # inserted AFTER the subcommand so the libexec dispatch sees
+    # ``fix /path --apply`` rather than ``/path fix --apply``.
+    # Source of truth lives in packages.sca.cli.SUBCOMMANDS — import
+    # it here to keep the lists in lock-step.
+    from packages.sca.cli import SUBCOMMANDS
+    _SCA_SUBCOMMANDS = set(SUBCOMMANDS)
     forwarded: list = []
     target_from_repo = None
+    repo_seen = False
     skip_next = False
     for i, arg in enumerate(args):
         if skip_next:
             skip_next = False
             continue
         if arg == "--repo" and i + 1 < len(args):
+            if repo_seen:
+                print("raptor.py sca: --repo specified more than once; "
+                      f"using the last value ({args[i + 1]!r})",
+                      file=sys.stderr)
             target_from_repo = args[i + 1]
+            repo_seen = True
             skip_next = True
             continue
         forwarded.append(arg)
     if target_from_repo is not None:
-        forwarded.insert(0, target_from_repo)
+        # Insert after the subcommand if one is present, else at front.
+        sub_idx = next(
+            (i for i, a in enumerate(forwarded) if a in _SCA_SUBCOMMANDS),
+            None,
+        )
+        if sub_idx is None:
+            forwarded.insert(0, target_from_repo)
+        else:
+            forwarded.insert(sub_idx + 1, target_from_repo)
 
     cmd = [sys.executable, str(sca_shim)] + forwarded
     try:
         from core.config import RaptorConfig
-        result = subprocess.run(cmd, env=RaptorConfig.get_safe_env())
+        # Trust marker — libexec/raptor-sca-run refuses to run without
+        # one of CLAUDECODE / _RAPTOR_TRUSTED in env. ``get_safe_env``'s
+        # allowlist (in this branch) doesn't include the markers, so we
+        # set the trust marker explicitly here. ``raptor.py`` is itself
+        # a trusted entry point.
+        env = RaptorConfig.get_safe_env()
+        env["_RAPTOR_TRUSTED"] = "1"
+        result = subprocess.run(cmd, env=env)
         return result.returncode
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")

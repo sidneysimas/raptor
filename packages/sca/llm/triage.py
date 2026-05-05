@@ -31,7 +31,7 @@ from . import (
 )
 from .exemplars import exemplar_blocks_for_supply_chain
 from .prompts import TRIAGE_SYSTEM
-from .schemas import TriageItem, TriageResult
+from .schemas import TriageResult
 
 logger = logging.getLogger(__name__)
 

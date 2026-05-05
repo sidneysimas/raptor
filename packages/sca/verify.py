@@ -1,10 +1,10 @@
-"""``/sca verify`` — confirm a ``proposed/`` patch from ``update`` actually
+"""``raptor-sca verify`` — confirm a ``proposed/`` patch from ``fix`` actually
 clears the findings it claimed to fix.
 
 Workflow:
 
     raptor-sca <target> --out base
-    raptor-sca update --findings base/findings.json --out fix
+    raptor-sca fix --findings base/findings.json --out fix
     # `fix/proposed/` contains rewritten manifests
     raptor-sca verify <target> --proposed fix/proposed [--findings base/findings.json]
 
@@ -25,7 +25,7 @@ Outputs (under ``--out``):
     verify-before/findings.json   if we had to re-run analyse on the original
     verify-after/findings.json    analyse result on the overlay
     delta.md                      markdown summary of the change
-    delta.json                    structured shape (same as `sca diff --json`)
+    delta.json                    structured shape (same as `raptor-sca diff --json`)
 
 Caveats:
 
@@ -87,10 +87,10 @@ def main(
     target = Path(args.target).resolve()
     proposed = Path(args.proposed).resolve()
     if not target.is_dir():
-        print(f"sca verify: target not a directory: {target}", file=sys.stderr)
+        print(f"raptor-sca verify: target not a directory: {target}", file=sys.stderr)
         return 2
     if not proposed.is_dir():
-        print(f"sca verify: --proposed dir not found: {proposed}",
+        print(f"raptor-sca verify: --proposed dir not found: {proposed}",
               file=sys.stderr)
         return 2
 
@@ -109,13 +109,13 @@ def main(
         _copy_target(target, overlay_dir)
         applied = _apply_overlay(proposed, overlay_dir)
     except OSError as e:
-        print(f"sca verify: cannot prepare overlay: {e}", file=sys.stderr)
+        print(f"raptor-sca verify: cannot prepare overlay: {e}", file=sys.stderr)
         return 3
     if not applied:
-        print(f"sca verify: --proposed dir contains no files; nothing to "
+        print(f"raptor-sca verify: --proposed dir contains no files; nothing to "
               f"verify ({proposed})", file=sys.stderr)
         return 2
-    logger.info("sca verify: applied %d proposed file(s) to overlay",
+    logger.info("raptor-sca verify: applied %d proposed file(s) to overlay",
                 len(applied))
 
     options = RunOptions(
@@ -131,13 +131,13 @@ def main(
         after = run_sca(target=overlay_dir, output_dir=after_dir,
                         options=options, http=http, cache=cache)
     except Exception as e:                 # noqa: BLE001
-        print(f"sca verify: analyse on overlay failed: {e}", file=sys.stderr)
+        print(f"raptor-sca verify: analyse on overlay failed: {e}", file=sys.stderr)
         return 3
 
     if args.findings:
         before_findings = Path(args.findings).resolve()
         if not before_findings.exists():
-            print(f"sca verify: --findings file not found: {before_findings}",
+            print(f"raptor-sca verify: --findings file not found: {before_findings}",
                   file=sys.stderr)
             return 2
     else:
@@ -146,7 +146,7 @@ def main(
             before = run_sca(target=target, output_dir=before_dir,
                              options=options, http=http, cache=cache)
         except Exception as e:             # noqa: BLE001
-            print(f"sca verify: analyse on target failed: {e}", file=sys.stderr)
+            print(f"raptor-sca verify: analyse on target failed: {e}", file=sys.stderr)
             return 3
         before_findings = before.findings_path
 
@@ -154,7 +154,7 @@ def main(
     rows_after = json.loads(after.findings_path.read_text(encoding="utf-8"))
     delta = compute_delta(rows_before, rows_after)
 
-    summary, exit_code = _verdict(delta, severity_floor=args.severity)
+    summary, exit_code = _verdict(delta, severity_floor=args.fail_on_severity)
     delta_md = _render_markdown(target, proposed, applied, delta, summary)
     (out_dir / "delta.md").write_text(delta_md, encoding="utf-8")
     (out_dir / "delta.json").write_text(
@@ -182,7 +182,7 @@ def main(
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca verify",
+        prog="raptor-sca verify",
         description="Apply a proposed/ patch to a copy of the target, "
                     "re-run analyse, and report whether the patch resolves "
                     "the open findings without regression.",
@@ -190,13 +190,13 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("target", help="path to the project the proposed/ "
                                   "patch was generated against")
     p.add_argument("--proposed", required=True,
-                   help="proposed/ directory from `sca update`")
+                   help="proposed/ directory from `raptor-sca fix`")
     p.add_argument("--findings",
                    help="baseline findings.json (default: re-run analyse "
                         "on the unmodified target)")
     p.add_argument("--out", help="output dir for verify-{before,after} + "
                                  "delta.md/delta.json")
-    p.add_argument("--severity", default="high",
+    p.add_argument("--fail-on-severity", default="high",
                    choices=("info", "low", "medium", "high", "critical"),
                    help="severity threshold for the regression check "
                         "(default: high)")

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Run /sca with run-lifecycle integration.
+"""Run raptor-sca with run-lifecycle integration.
+
+Called by ``bin/raptor-sca`` (user-facing CLI) or directly by the LLM.
 
 Usage:
-  raptor-sca [<target>] [analyse-flags...]      # default: analyse
-  raptor-sca review <eco> <name> <version> ...
-  raptor-sca whatif <eco> <name> <from> <to>|--candidate ...
-  raptor-sca update --findings <path> | --target <path> ...
+  raptor-sca-run <target> [flags]                    Scan a project
+  raptor-sca-run fix <target> [--allow-major]        Scan + fix CVEs + tighten pins
+  raptor-sca-run fix <target> --cve-only             Fix CVEs only
+  raptor-sca-run fix <target> --harden               Upgrade to latest safe versions
+  raptor-sca-run check <eco> <name> <version>        Pre-install safety verdict
+  raptor-sca-run upgrade <eco> <name> <from> <to>    Upgrade impact comparison
+  raptor-sca-run diff <baseline> <current>           Delta between two scan runs
 
-Only the analyse path interacts with the run-lifecycle helpers (the
+Only the scan path interacts with the run-lifecycle helpers (the
 findings.json + report.md produced are first-class run artefacts that
 the rest of RAPTOR consumes). The sub-commands run as-is and write
 their outputs to whatever ``--out`` the operator supplies.
 
-Target resolution for analyse (per CLAUDE.md DEFAULT TARGET DIRECTORY):
+Target resolution for scan (per CLAUDE.md DEFAULT TARGET DIRECTORY):
   1. Explicit positional argument
   2. Active project's target (resolved by ``get_output_dir``)
   3. $RAPTOR_CALLER_DIR (launcher saves the user's cwd before chdir)
@@ -24,6 +29,18 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+# ─── trust-marker check (do not import; inline by design) ───
+if not (os.environ.get("CLAUDECODE")
+        or os.environ.get("_RAPTOR_TRUSTED")):
+    sys.stderr.write(
+        f"{sys.argv[0]}: internal dispatch script.\n"
+        "  Users: run 'bin/raptor-sca <args>' instead.\n"
+        "  Tests / power users: set _RAPTOR_TRUSTED=1 to bypass.\n"
+    )
+    sys.exit(2)
+# ─── end trust-marker check ─────────────────────────────────
+
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -34,18 +51,69 @@ from core.run.output import get_output_dir                           # noqa: E40
 from packages.sca import cli as sca_cli                              # noqa: E402
 from packages.sca.cli import _configure_logging, _print_summary      # noqa: E402
 from packages.sca.pipeline import RunOptions, run_sca                # noqa: E402
+from packages.sca.cli import SUBCOMMANDS as _SUBCOMMANDS              # noqa: E402
 
-_SUBCOMMANDS = ("review", "whatif", "update", "harden",
-                "diff", "verify", "render", "purl", "health")
+_HELP = """\
+raptor-sca — dependency security scanner
+
+Commands:
+  raptor-sca <path>                              Scan for vulnerabilities
+  raptor-sca fix <path>                          Show fix plan (safe default)
+  raptor-sca fix <path> --apply                  Apply fixes in-place
+  raptor-sca fix <path> --apply --allow-major    Include major-version bumps
+  raptor-sca check PyPI django 4.2.10            Pre-install safety verdict
+  raptor-sca upgrade npm lodash 4.17.4 4.17.21   Upgrade impact comparison
+  raptor-sca diff old.json new.json              Delta between two scans
+
+CI gate (exit 1 if thresholds exceeded):
+  raptor-sca <path> --fail-on-severity high      Scan + fail on high+ findings
+  raptor-sca <path> --fail-on-kev                Fail if any KEV-listed CVE
+  raptor-sca render <findings.json> --fail-on-severity high
+                                                 Evaluate existing findings
+
+Utilities:
+  raptor-sca verify <path> --proposed <dir>      Confirm proposed fixes
+  raptor-sca health                              Registry reachability check
+  raptor-sca purl PyPI django 4.2.10             Print canonical Package URL
+  raptor-sca render <findings.json>              Re-emit report.md / SARIF
+  raptor-sca clean-cache --max-age 30            Reclaim disk from stale cache
+
+Run 'raptor-sca <command> --help' for command-specific options.
+Run 'raptor-sca --help-scan' for full scan options.
+"""
 
 
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
 
+    if not raw and not os.environ.get("RAPTOR_CALLER_DIR"):
+        sys.stdout.write(_HELP)
+        return 0
+
+    if len(raw) == 1 and raw[0] in ("-h", "--help"):
+        sys.stdout.write(_HELP)
+        return 0
+
+    if len(raw) >= 1 and raw[0] == "--help-scan":
+        return _run_analyse(["--help"])
+
     # Sub-commands bypass lifecycle: their artefacts aren't run-shaped
     # (e.g., a single-line review verdict, a markdown delta report).
     if raw and raw[0] in _SUBCOMMANDS:
         return sca_cli.main(raw)
+
+    # Catch misspelled subcommands before they fall through to the scan
+    # path (where they'd fail as "not a directory").
+    if (raw and not raw[0].startswith("-")
+            and not raw[0].startswith("/")
+            and os.path.sep not in raw[0]
+            and not os.path.exists(raw[0])):
+        print(
+            f"raptor-sca: unknown subcommand {raw[0]!r}\n"
+            f"Run 'raptor-sca --help' for available commands.",
+            file=sys.stderr,
+        )
+        return 2
 
     return _run_analyse(raw)
 
@@ -60,18 +128,29 @@ def _parse_analyse(argv):
                    help="path to project (default: active project / "
                         "$RAPTOR_CALLER_DIR)")
     p.add_argument("--out", help="explicit output directory")
-    p.add_argument("--offline", action="store_true")
-    p.add_argument("--no-cache", action="store_true")
-    p.add_argument("--no-kev", action="store_true")
-    p.add_argument("--no-epss", action="store_true")
-    p.add_argument("--no-reachability", action="store_true")
-    p.add_argument("--no-supply-chain", action="store_true")
+    p.add_argument("--offline", action="store_true",
+                   help="skip all network calls; use cache only")
+    p.add_argument("--no-cache", action="store_true",
+                   help="bypass disk cache for this run")
+    p.add_argument("--no-kev", action="store_true",
+                   help="skip CISA KEV enrichment")
+    p.add_argument("--no-epss", action="store_true",
+                   help="skip FIRST.org EPSS enrichment")
+    p.add_argument("--no-reachability", action="store_true",
+                   help="skip module-level reachability scan")
+    p.add_argument("--no-supply-chain", action="store_true",
+                   help="skip mechanical supply-chain heuristics")
     p.add_argument("--include-commented", action="store_true",
                    help="parse commented-out version-pinned lines as deps; "
                         "matching CVEs surface at info severity")
     p.add_argument("--no-inline-installs", action="store_true",
                    help="skip Dockerfile / devcontainer.json / shell / GHA "
                         "extraction of pip / apt / yum / dnf / apk installs")
+    p.add_argument("--no-resolve-transitive", action="store_true",
+                   help="don't generate a lockfile for manifests that lack one")
+    p.add_argument("--fallback-registry-metadata", action="store_true",
+                   help="approximate transitives from registry metadata "
+                        "when no toolchain is available")
     p.add_argument("--use-offline-db", action="store_true",
                    help="route OSV lookups through a local sqlite-backed "
                         "copy of the OSV daily-dump zips")
@@ -94,8 +173,13 @@ def _parse_analyse(argv):
     p.add_argument("--impact-analysis", action="store_true",
                    help="run LLM upgrade-impact analysis for proposed "
                         "version bumps")
-    p.add_argument("--cache-root")
-    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--cache-root",
+                   help="override default cache root directory")
+    # CI gate flags — exit 1 if findings exceed thresholds.
+    from packages.sca.thresholds import add_threshold_args
+    add_threshold_args(p)
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="-v INFO, -vv DEBUG (default: WARNING)")
     return p.parse_args(argv)
 
 
@@ -120,8 +204,11 @@ def _run_analyse(argv):
             file=sys.stderr,
         )
         return 2
-    if not target.exists() or not target.is_dir():
-        print(f"raptor-sca: target not a directory: {target}", file=sys.stderr)
+    if not target.exists():
+        print(f"raptor-sca: target does not exist: {target}", file=sys.stderr)
+        return 2
+    if not target.is_dir():
+        print(f"raptor-sca: target is not a directory: {target}", file=sys.stderr)
         return 2
 
     try:
@@ -154,6 +241,8 @@ def _run_analyse(argv):
         enable_supply_chain=not args.no_supply_chain,
         include_commented=args.include_commented,
         enable_inline_installs=not args.no_inline_installs,
+        enable_transitive_expansion=not args.no_resolve_transitive,
+        fallback_registry_metadata=args.fallback_registry_metadata,
         use_offline_db=args.use_offline_db,
         offline_db_path=(Path(args.offline_db_path)
                           if args.offline_db_path else None),
@@ -184,6 +273,29 @@ def _run_analyse(argv):
 
     complete_run(output_dir)
     _print_summary(result)
+
+    # CI-gate threshold evaluation — only fires when --fail-on-* set.
+    from packages.sca.thresholds import (
+        cfg_from_args, evaluate as eval_thresholds, print_result,
+    )
+    cfg = cfg_from_args(args)
+    if cfg.is_active:
+        import json as _json
+        try:
+            rows = _json.loads(
+                (output_dir / "findings.json").read_text(encoding="utf-8")
+            )
+        except (OSError, _json.JSONDecodeError) as e:
+            print(f"raptor-sca: cannot read findings for threshold check: {e}",
+                  file=sys.stderr)
+            return 3
+        if not isinstance(rows, list):
+            print("raptor-sca: findings.json is not a list", file=sys.stderr)
+            return 3
+        passed, fails = eval_thresholds(rows, cfg)
+        print_result(passed, fails)
+        return 0 if passed else 1
+
     return 0
 
 

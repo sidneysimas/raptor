@@ -1,4 +1,4 @@
-"""Tests for ``packages.sca.update`` (the ``/sca update`` subcommand)."""
+"""Tests for ``packages.sca.update`` (the ``raptor-sca fix --cve-only`` subcommand)."""
 
 from __future__ import annotations
 

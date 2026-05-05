@@ -1,6 +1,6 @@
-"""``/sca diff`` — set-difference between two ``findings.json`` runs.
+"""``raptor-sca diff`` — set-difference between two ``findings.json`` runs.
 
-Common CI question: "did this PR introduce any new vulns?". `sca diff`
+Common CI question: "did this PR introduce any new vulns?". ``raptor-sca diff``
 takes the previous baseline and the current run, classifies each
 finding into:
 
@@ -68,7 +68,7 @@ def main(argv: Sequence[str]) -> int:
         sys.stdout.write("\n")
     sys.stdout.flush()
 
-    threshold = severity_rank(args.severity)
+    threshold = severity_rank(args.fail_on_severity)
     triggering = [
         r for r in delta.new
         if severity_rank(r.get("severity", "info")) >= threshold
@@ -145,7 +145,7 @@ def compute_delta(
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="sca diff",
+        prog="raptor-sca diff",
         description="Compare two findings.json files; "
                     "report new / resolved / suppression-state changes.",
     )
@@ -157,7 +157,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--include-suppressed", action="store_true",
                    help="treat suppressed findings as visible (default: skip "
                         "them from new/resolved)")
-    p.add_argument("--severity", default="high",
+    p.add_argument("--fail-on-severity", default="high",
                    choices=("info", "low", "medium", "high", "critical"),
                    help="severity threshold for the exit-code check "
                         "(default: high)")
@@ -168,15 +168,15 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def _load_rows(path_str: str) -> Optional[List[Dict[str, Any]]]:
     path = Path(path_str).resolve()
     if not path.exists():
-        print(f"sca diff: file not found: {path}", file=sys.stderr)
+        print(f"raptor-sca diff: file not found: {path}", file=sys.stderr)
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"sca diff: cannot read {path}: {e}", file=sys.stderr)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"raptor-sca diff: cannot read {path}: {e}", file=sys.stderr)
         return None
     if not isinstance(data, list):
-        print(f"sca diff: {path} is not a finding list", file=sys.stderr)
+        print(f"raptor-sca diff: {path} is not a finding list", file=sys.stderr)
         return None
     return data
 
@@ -226,6 +226,8 @@ def _index_by_canonical_key(
     """
     out: Dict[Tuple[str, ...], Dict[str, Any]] = {}
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         key = _canonical_key(row)
         if key is None:
             continue
@@ -266,7 +268,7 @@ def _delta_to_dict(d: DeltaResult) -> Dict[str, Any]:
 
 def _render_markdown(a_path: str, b_path: str, d: DeltaResult) -> str:
     buf = StringIO()
-    buf.write(f"# sca diff — `{a_path}` → `{b_path}`\n\n")
+    buf.write(f"# raptor-sca diff — `{a_path}` → `{b_path}`\n\n")
     buf.write(f"- New: **{len(d.new)}**\n")
     buf.write(f"- Resolved: **{len(d.resolved)}**\n")
     if d.suppression_added or d.suppression_lifted:
@@ -314,7 +316,7 @@ def _table(
         name = sca.get("name") or ""
         version = sca.get("version") or ""
         adv = sca.get("advisory") or {}
-        adv_id = adv.get("id") if isinstance(adv, dict) else ""
+        adv_id = (adv.get("id") if isinstance(adv, dict) else "") or ""
         finding_label = f"{eco}:{name}@{version} {adv_id}".strip()
         if show_suppression:
             reason = r.get("suppression_reason") or "—"

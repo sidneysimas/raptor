@@ -104,7 +104,7 @@ class Dependency:
                                     # is a transitive dep approximated by
                                     # registry-metadata recursion (less
                                     # accurate); ``review`` is operator-
-                                    # supplied to ``/sca review``.
+                                    # supplied to ``raptor-sca check``.
 
     def key(self) -> str:
         """Stable identity for dedup / cross-reference."""

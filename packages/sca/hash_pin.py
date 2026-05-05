@@ -1,6 +1,6 @@
 """Hash-pin support — convert mutable git refs to commit SHAs.
 
-Implements the design's ``/sca update --hash-pin`` feature for the
+Implements the design's ``raptor-sca fix --hash-pin`` feature for the
 GitHub Actions workflow case (the primary Trivy-attack-class target).
 Operators with non-GHA git refs (npm ``git+https://``, Cargo git,
 Composer git) currently get a warning; those handlers can drop in here.
@@ -171,12 +171,20 @@ def _resolve_sha(
     if key in cache:
         return cache[key]
     url = f"https://github.com/{owner}/{repo}.git"
+    # Pass token via -c http.extraheader rather than embedding in the
+    # URL. The token still appears in our own /proc/<pid>/cmdline (so
+    # same-uid processes can read it), but it no longer appears inside
+    # the URL — keeping it out of git's URL-rewriting code paths and
+    # its on-disk credential cache. For full token isolation, callers
+    # should set the GIT_HTTP_EXTRAHEADER env var or use GIT_ASKPASS.
+    cmd = ["git"]
     if token:
-        url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+        cmd += ["-c", f"http.extraheader=Authorization: bearer {token}"]
+    cmd += ["ls-remote", url, ref,
+            f"refs/tags/{ref}", f"refs/heads/{ref}"]
     try:
         proc = subprocess.run(
-            ["git", "ls-remote", url, ref,
-              f"refs/tags/{ref}", f"refs/heads/{ref}"],
+            cmd,
             capture_output=True, text=True, timeout=20,
         )
     except (subprocess.SubprocessError, OSError) as e:

@@ -70,6 +70,8 @@ def exfil_destinations_block() -> Optional[UntrustedBlock]:
 
     by_category: dict[str, list[str]] = {}
     for entry in entries:
+        if not isinstance(entry, dict):
+            continue  # malformed exfil-list entry — skip rather than crash
         cat = entry.get("category", "other")
         label = entry.get("host") or entry.get("tld") or entry.get("pattern", "?")
         by_category.setdefault(cat, []).append(label)

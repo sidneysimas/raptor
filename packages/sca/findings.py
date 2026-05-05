@@ -526,7 +526,14 @@ def _json_default(obj: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def severity_rank(severity: Severity) -> int:
-    return _SEVERITY_RANK.get(severity, 0)
+    """Return the rank for a severity string. Case-insensitive — LLM
+    verdicts and hand-edited findings frequently capitalise (``Critical``,
+    ``HIGH``); a case-sensitive lookup would silently treat them as 0
+    and let CI gates pass when they shouldn't.
+    """
+    if not severity:
+        return 0
+    return _SEVERITY_RANK.get(severity.lower(), 0)
 
 
 __all__ = [
