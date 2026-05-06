@@ -138,11 +138,22 @@ def scan_target(
     manifests: Iterable[Manifest],
     *,
     max_depth: int = _DEFAULT_MAX_DEPTH,
+    cache=None,
 ) -> List[ImportTimeFinding]:
-    """Walk ``target`` Python sources; return per-file flagged statements."""
+    """Walk ``target`` Python sources; return per-file flagged statements.
+
+    ``cache`` (a :class:`core.json.JsonCache`) caches the per-file
+    flagged-call list (line + label) keyed by file content hash —
+    repeat scans of unchanged files skip the AST parse entirely.
+    The host-dep attribution is recomputed on retrieval (it depends
+    on ``manifests`` + ``target`` + ``path`` rather than on file
+    content), so a manifest set change doesn't invalidate the
+    per-file content cache.
+    """
     target = target.resolve()
     manifests_list = list(manifests)
     out: List[ImportTimeFinding] = []
+    from .._file_scan_cache import cached_per_file
     for path in _walk_python_sources(target, max_depth=max_depth):
         if _looks_like_test_path(path, target):
             continue
@@ -154,21 +165,48 @@ def scan_target(
                 path, e,
             )
             continue
-        try:
-            # Suppress SyntaxWarning from scanned source — those are
-            # the target's hygiene issues, not raptor-sca's, and leak
-            # to operator stderr as confusing noise.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                tree = ast.parse(text, filename=str(path))
-        except SyntaxError as e:
-            logger.debug(
-                "sca.supply_chain.python_imports: parse failed for %s: %s",
-                path, e,
-            )
-            continue
-        for finding in _scan_module(tree, path, target, manifests_list):
-            out.append(finding)
+
+        def _compute(text=text, path=path):
+            """Parse + extract per-file flagged-statement records.
+            Returned as plain dicts so the cache can JSON-serialise
+            them. Retrieval reconstructs ``ImportTimeFinding`` with
+            the current target/manifests/path."""
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    tree = ast.parse(text, filename=str(path))
+            except SyntaxError as e:
+                logger.debug(
+                    "sca.supply_chain.python_imports: parse failed for %s: %s",
+                    path, e,
+                )
+                return []
+            recs = []
+            for f in _scan_module(tree, path, target, manifests_list):
+                recs.append({
+                    "detail": f.detail,
+                    "line": f.line,
+                    "severity": f.severity,
+                    "confidence_level": f.confidence.level,
+                    "confidence_reason": f.confidence.reason,
+                })
+            return recs
+
+        recs = cached_per_file(
+            cache, "supply_chain:py-imports", text, _compute,
+        )
+        host_dep = _project_host_dep(manifests_list, path, target)
+        for r in recs:
+            out.append(ImportTimeFinding(
+                dependency=host_dep,
+                detail=r["detail"],
+                path=path,
+                line=r["line"],
+                severity=r["severity"],
+                confidence=Confidence(
+                    r["confidence_level"], reason=r["confidence_reason"],
+                ),
+            ))
     return out
 
 

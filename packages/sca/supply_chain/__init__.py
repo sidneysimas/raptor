@@ -63,6 +63,7 @@ def evaluate(
     *,
     pypi_client=None,
     npm_client=None,
+    cache=None,
 ) -> List[SupplyChainFinding]:
     """Run every mechanical supply-chain check.
 
@@ -93,7 +94,9 @@ def evaluate(
     for art in _artefacts.scan_target(target, manifests_list):
         out.append(_artefact_to_finding(art))
 
-    for it in _python_imports.scan_target(target, manifests_list):
+    for it in _python_imports.scan_target(
+        target, manifests_list, cache=cache,
+    ):
         out.append(_python_import_to_finding(it))
 
     for ex in _exfil.scan_target(target, manifests_list):

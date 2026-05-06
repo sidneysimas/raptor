@@ -119,7 +119,13 @@ def scan(
             continue
         scanner, resolver = handler
         try:
-            scan_result = scanner(target)
+            # Pass ``cache`` through when the scanner accepts it (the
+            # Python scanner does; others may not). Inspect rather
+            # than try/except so we don't swallow real errors.
+            import inspect
+            sig = inspect.signature(scanner)
+            scan_kwargs = {"cache": cache} if "cache" in sig.parameters else {}
+            scan_result = scanner(target, **scan_kwargs)
         except Exception:                   # noqa: BLE001
             logger.warning(
                 "sca.reachability: %s scanner failed; deps marked "

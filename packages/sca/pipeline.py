@@ -269,6 +269,7 @@ def run_sca(
             target, manifests, joined,
             pypi_client=sc_pypi,
             npm_client=sc_npm,
+            cache=cache,
         )
 
     # 3. Canonical dep set: lockfile-preferred, deduped per (eco, name, ver).

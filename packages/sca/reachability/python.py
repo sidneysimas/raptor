@@ -100,16 +100,24 @@ _DIST_TO_MODULES: Dict[str, Tuple[str, ...]] = _load_dist_to_modules()
 
 
 def scan_imports(
-    target: Path, *, max_depth: int = _DEFAULT_MAX_DEPTH,
+    target: Path, *,
+    max_depth: int = _DEFAULT_MAX_DEPTH,
+    cache=None,
 ) -> Dict[str, List[Tuple[Path, int, bool]]]:
     """Return ``{module_name: [(file, line, is_test_code), ...]}``.
 
     The boolean third tuple element marks whether the import lives in
     test code; downstream callers may treat test-only references as
     weaker evidence than production-source references.
+
+    ``cache`` (a :class:`core.json.JsonCache`) is used to cache the
+    per-file extracted ``[(module, line)]`` list keyed by file
+    content hash — repeat scans of unchanged files skip the AST
+    parse entirely. Pass ``None`` for the legacy uncached behaviour.
     """
     target = target.resolve()
     out: Dict[str, List[Tuple[Path, int, bool]]] = {}
+    from .._file_scan_cache import cached_per_file
     for py_file in _walk_python_sources(target, max_depth=max_depth):
         is_test = _is_test_file(py_file, target)
         try:
@@ -117,23 +125,35 @@ def scan_imports(
         except OSError as e:
             logger.debug("sca.reachability.python: skip %s (%s)", py_file, e)
             continue
-        try:
-            # Suppress SyntaxWarning (invalid escape sequences,
-            # ``is`` with literals, etc.) from the parsed file. Those
-            # are issues in the SCANNED source, not in raptor-sca; they
-            # leak to operator stderr otherwise and create noise.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                tree = ast.parse(text, filename=str(py_file))
-        except SyntaxError as e:
-            logger.debug(
-                "sca.reachability.python: ast parse failed for %s: %s",
-                py_file, e,
-            )
-            continue
-        for node in ast.walk(tree):
-            for top_module, line in _modules_from_node(node):
-                out.setdefault(top_module, []).append((py_file, line, is_test))
+
+        def _compute(text=text, py_file=py_file):
+            """Parse + extract per-file ``[(module, line)]`` pairs.
+            Closed over ``text`` and ``py_file`` so the cache can call
+            this lazily on a miss. Test-status is recomputed at
+            retrieval time (depends on path + target, not file
+            content) — caching it would require a path+target axis on
+            the key for no real gain."""
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    tree = ast.parse(text, filename=str(py_file))
+            except SyntaxError as e:
+                logger.debug(
+                    "sca.reachability.python: ast parse failed for %s: %s",
+                    py_file, e,
+                )
+                return []
+            pairs: List[Tuple[str, int]] = []
+            for node in ast.walk(tree):
+                for top_module, line in _modules_from_node(node):
+                    pairs.append((top_module, line))
+            return pairs
+
+        pairs = cached_per_file(
+            cache, "reachability:py-imports", text, _compute,
+        )
+        for top_module, line in pairs:
+            out.setdefault(top_module, []).append((py_file, line, is_test))
     return out
 
 
