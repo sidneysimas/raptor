@@ -261,7 +261,16 @@ def _try_cascade(
     # at the orchestrator's caller. The orchestrator's dedup against
     # direct_deps strips overlap; what's left here is purely transitive,
     # so direct=False is correct for the whole list.
-    tagged = [_with_cascade_source(d) for d in deps]
+    #
+    # ``declared_in`` is also re-tagged to the host manifest path —
+    # the cascade lockfile lives in a per-call ``TemporaryDirectory``
+    # whose path looks like ``/tmp/raptor-sca-cascade-<rand>/...``
+    # and is gone before the report renders. Pointing operators at
+    # the host manifest (the file they can actually edit) is more
+    # useful than at a vanished temp.
+    tagged = [
+        _with_cascade_source(d, host_manifest_path) for d in deps
+    ]
     return tagged, None
 
 
@@ -286,20 +295,28 @@ def _parse_lockfile_bytes(
         return None
 
 
-def _with_cascade_source(d: Dependency) -> Dependency:
+def _with_cascade_source(
+    d: Dependency, host_manifest_path: Path,
+) -> Dependency:
     """Re-tag a Dependency as cascade_resolver-sourced.
 
-    Two re-tags happen here:
+    Three re-tags happen here:
       - ``source_kind="cascade_resolver"`` — the bytes came from an
         in-sandbox cascade run, not a checked-in lockfile; the
         report distinction matters for triage trust.
       - ``direct=False`` — cascade output is the transitive closure;
         the orchestrator dedups against the operator's actual
         direct deps before the result reaches ``join_deps``.
+      - ``declared_in=host_manifest_path`` — the original
+        ``declared_in`` from the parser points at the cascade temp
+        lockfile (``/tmp/raptor-sca-cascade-<rand>/...``), which is
+        deleted before the report renders. The operator-actionable
+        path is the host manifest that triggered the cascade — what
+        they need to edit to change the resolution input.
     """
     return Dependency(
         ecosystem=d.ecosystem, name=d.name, version=d.version,
-        declared_in=d.declared_in, scope=d.scope,
+        declared_in=host_manifest_path, scope=d.scope,
         is_lockfile=d.is_lockfile, pin_style=d.pin_style,
         direct=False,
         purl=d.purl,
