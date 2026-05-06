@@ -196,13 +196,70 @@ def _render_summary(
 
 
 def _render_vuln_section(findings: Sequence[VulnFinding]) -> str:
+    """Group + render vulnerability findings.
+
+    Multiple manifests declaring the same vulnerable dep at the
+    same version produce one finding per (dep, advisory) pair —
+    so the raw list contains duplicates that share an advisory but
+    differ only in ``dep.declared_in``. Group on
+    ``(name, version, primary_advisory_id)`` so each distinct CVE
+    on each version gets one section, with sources listed
+    underneath. Distinct advisories on the same version stay
+    separate (different CVEs are different findings).
+    """
     lines: List[str] = ["## Vulnerable dependencies\n"]
-    for f in findings:
-        lines.append(_render_one_vuln(f))
+    groups = _group_vulns(findings)
+    for group in groups:
+        lines.append(_render_one_vuln_group(group))
     return "\n".join(lines)
 
 
-def _render_one_vuln(f: VulnFinding) -> str:
+def _group_vulns(
+    findings: Sequence[VulnFinding],
+) -> List[List[VulnFinding]]:
+    """Bucket vuln findings by (name, version, primary advisory id).
+
+    Ordering: groups are emitted in the order their first member
+    appears in the input — preserves the caller's severity-sorted
+    order without an extra sort pass.
+    """
+    groups: dict[tuple, List[VulnFinding]] = {}
+    order: List[tuple] = []
+    for f in findings:
+        primary_id = f.advisories[0].osv_id if f.advisories else ""
+        key = (f.dependency.name, f.dependency.version or "", primary_id)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f)
+    return [groups[k] for k in order]
+
+
+def _render_one_vuln_group(group: Sequence[VulnFinding]) -> str:
+    """Render a vuln finding group: one section per (dep, advisory),
+    with each manifest source listed in a Sources sub-list.
+
+    Single-source groups render as the original "Source: manifest
+    (path)" line — visually identical to pre-dedup output. Multi-
+    source groups replace that single line with a "Sources (N):"
+    bullet plus a nested list of paths. The threshold is on
+    distinct paths, not on group size — N findings that all share
+    one declared_in path stay as a single Source line."""
+    primary = group[0]
+    paths = sorted({str(f.dependency.declared_in) for f in group})
+    body = _render_one_vuln(primary, omit_source=len(paths) > 1)
+    if len(paths) <= 1:
+        return body
+    src_lines = [f"- Sources ({len(paths)}):"]
+    for p in paths:
+        src_lines.append(f"  - `{escape_nonprintable(p)}`")
+    # Insert sources bullet right after the head line so it's near
+    # the top of the section rather than buried at the bottom.
+    head, _, rest = body.partition("\n")
+    return head + "\n" + "\n".join(src_lines) + "\n" + rest
+
+
+def _render_one_vuln(f: VulnFinding, *, omit_source: bool = False) -> str:
     dep = f.dependency
     primary: Optional[Advisory] = f.advisories[0] if f.advisories else None
     label = _SEV_LABEL.get(f.severity, f.severity.title())
@@ -233,10 +290,11 @@ def _render_one_vuln(f: VulnFinding) -> str:
     if badges:
         bullets.append(f"- {' / '.join(badges)}")
 
-    if dep.is_lockfile:
-        bullets.append(f"- Source: lockfile (`{dep.declared_in}`)")
-    else:
-        bullets.append(f"- Source: manifest (`{dep.declared_in}`)")
+    if not omit_source:
+        if dep.is_lockfile:
+            bullets.append(f"- Source: lockfile (`{dep.declared_in}`)")
+        else:
+            bullets.append(f"- Source: manifest (`{dep.declared_in}`)")
     bullets.append(f"- Direct: {'yes' if dep.direct else 'no'}; "
                    f"scope: {dep.scope}; pin: {dep.pin_style.value}")
 
@@ -299,46 +357,102 @@ def _badges(f: VulnFinding) -> List[str]:
 def _render_supply_chain_section(
     findings: Sequence[SupplyChainFinding],
 ) -> str:
+    """Group + render supply-chain findings — see
+    :func:`_render_vuln_section` for the rationale. Same dep at the
+    same version flagged for the same kind across multiple manifests
+    collapses to one section with a Sources list."""
     lines: List[str] = ["## Supply-chain findings\n"]
-    for f in findings:
-        dep = f.dependency
-        label = _SEV_LABEL.get(f.severity, f.severity.title())
-        head = (
-            f"### {label} — {f.kind}: "
-            f"{dep.ecosystem}:{escape_nonprintable(dep.name)}"
-        )
-        bullets = [
-            f"- Detail: {escape_nonprintable(f.detail)}",
-            f"- Source: `{dep.declared_in}`",
-            f"- Confidence: {f.confidence.level} "
-            f"({escape_nonprintable(f.confidence.reason)})"
-            if f.confidence.reason else f"- Confidence: {f.confidence.level}",
-        ]
-        lines.append(head + "\n" + "\n".join(bullets) + "\n")
+    for group in _group_kinded(findings):
+        lines.append(_render_one_kinded_group(group))
     return "\n".join(lines)
 
 
 def _render_hygiene_section(findings: Sequence[HygieneFinding]) -> str:
     lines: List[str] = ["## Hygiene findings\n"]
-    for f in findings:
-        lines.append(_render_one_hygiene(f))
+    for group in _group_kinded(findings):
+        lines.append(_render_one_kinded_group(group))
     return "\n".join(lines)
 
 
-def _render_one_hygiene(f: HygieneFinding) -> str:
-    dep = f.dependency
-    label = _SEV_LABEL.get(f.severity, f.severity.title())
+def _group_kinded(findings: Sequence) -> List[List]:
+    """Bucket hygiene/supply-chain findings by
+    ``(kind, ecosystem, name, version, detail)``. Both shapes share
+    the same fields we key on, so one helper covers both.
+
+    ``detail`` is part of the key — without it kind-level groupings
+    over-collapse: ``gha_action_ref_drift`` findings on different
+    workflow line:action pairs all share
+    ``(kind, ecosystem, '<github-actions>', None)`` and would
+    otherwise be reported as one section showing only the first
+    detail. Identical-detail findings (e.g. the same ``loose_pin``
+    detail repeated across N manifests) still collapse to a single
+    section with a Sources list — that's the duplication we
+    actually want to remove. Ordering preserves first-seen so the
+    caller's severity-sorted ordering survives."""
+    groups: dict[tuple, list] = {}
+    order: List[tuple] = []
+    for f in findings:
+        dep = f.dependency
+        key = (
+            f.kind, dep.ecosystem, dep.name, dep.version or "",
+            f.detail,
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f)
+    return [groups[k] for k in order]
+
+
+def _render_one_kinded_group(group: Sequence) -> str:
+    """Render one (kind, dep) group as a single section. Single-
+    source groups produce identical output to the pre-dedup
+    renderer; multi-source groups list each contributing manifest
+    under a "Sources (N):" bullet.
+
+    Confidence is taken from the highest-ranked member to avoid
+    silently downgrading a finding that's stronger from one source
+    than another. Detail is taken from the first member — they're
+    expected to be identical (same kind, same dep) and any
+    divergence would already be a bug at the finding-emit layer."""
+    primary = group[0]
+    dep = primary.dependency
+    label = _SEV_LABEL.get(primary.severity, primary.severity.title())
     head = (
-        f"### {label} — {f.kind}: "
+        f"### {label} — {primary.kind}: "
         f"{dep.ecosystem}:{escape_nonprintable(dep.name)}"
     )
-    bullets = [
-        f"- Detail: {escape_nonprintable(f.detail)}",
-        f"- Source: `{dep.declared_in}`",
-        f"- Confidence: {f.confidence.level} "
-        f"({escape_nonprintable(f.confidence.reason)})"
-        if f.confidence.reason else f"- Confidence: {f.confidence.level}",
-    ]
+    # Pick the strongest confidence in the group.
+    confidence_levels = ["low", "medium", "high"]
+    best_conf = primary.confidence
+    for f in group[1:]:
+        if (
+            confidence_levels.index(f.confidence.level)
+            > confidence_levels.index(best_conf.level)
+        ):
+            best_conf = f.confidence
+
+    bullets = [f"- Detail: {escape_nonprintable(primary.detail)}"]
+    # Switch to a list when there are MULTIPLE distinct source
+    # paths. A group of N findings that all share one declared_in
+    # path (duplicate findings the emitter happened to produce
+    # twice) renders as a single Source line — operators don't
+    # need to be told "Sources (1):" when there's just one.
+    paths = sorted({str(f.dependency.declared_in) for f in group})
+    if len(paths) == 1:
+        bullets.append(f"- Source: `{paths[0]}`")
+    else:
+        bullets.append(f"- Sources ({len(paths)}):")
+        for p in paths:
+            bullets.append(f"  - `{escape_nonprintable(p)}`")
+
+    if best_conf.reason:
+        bullets.append(
+            f"- Confidence: {best_conf.level} "
+            f"({escape_nonprintable(best_conf.reason)})"
+        )
+    else:
+        bullets.append(f"- Confidence: {best_conf.level}")
     return head + "\n" + "\n".join(bullets) + "\n"
 
 

@@ -198,6 +198,164 @@ def test_write_markdown_report_atomic(tmp_path: Path) -> None:
     assert all(p.suffix != ".tmp" for p in tmp_path.iterdir())
 
 
+# ---------------------------------------------------------------------------
+# Report-side dedup
+# ---------------------------------------------------------------------------
+
+
+def _supply_chain(kind: str = "version_publish",
+                  declared_in: str = "/repo/package.json",
+                  detail: str = "publish frequency outlier",
+                  severity: str = "info"):
+    """Build a SupplyChainFinding for dedup tests. Each fixture lets
+    callers override ``declared_in`` to simulate the same dep being
+    flagged in multiple manifests."""
+    from packages.sca.models import SupplyChainFinding
+    dep = Dependency(
+        ecosystem="PyPI", name="requests", version="2.31.0",
+        declared_in=Path(declared_in),
+        scope="main", is_lockfile=False,
+        pin_style=PinStyle.RANGE, direct=True,
+        purl="pkg:pypi/[email protected]",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+    return SupplyChainFinding(
+        finding_id=f"sca:supply_chain:{kind}:PyPI:requests:{declared_in}",
+        kind=kind,                                         # type: ignore[arg-type]
+        dependency=dep, detail=detail, evidence={},
+        severity=severity,                                 # type: ignore[arg-type]
+        confidence=Confidence("high", reason="t"),
+    )
+
+
+def test_supply_chain_same_kind_across_manifests_collapses_to_one_section() -> None:
+    """Same (kind, dep, version) declared in 4 manifests → ONE
+    section with a Sources list of 4 paths. Without dedup the
+    report would carry 4 near-identical sections that drown the
+    signal."""
+    findings = [
+        _supply_chain(declared_in=f"/repo/m{i}.txt") for i in range(4)
+    ]
+    md = render_markdown_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=[], hygiene_findings=[],
+        supply_chain_findings=findings,
+    )
+    assert md.count("### Info — version_publish: PyPI:requests") == 1
+    assert "Sources (4):" in md
+    for i in range(4):
+        assert f"/repo/m{i}.txt" in md
+
+
+def test_supply_chain_distinct_kinds_keep_separate_sections() -> None:
+    """Different ``kind`` values for the same dep stay separate —
+    they're different findings, not duplicates."""
+    findings = [
+        _supply_chain(kind="version_publish"),
+        _supply_chain(kind="low_bus_factor", declared_in="/repo/other.txt"),
+    ]
+    md = render_markdown_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=[], hygiene_findings=[],
+        supply_chain_findings=findings,
+    )
+    assert "### Info — version_publish: PyPI:requests" in md
+    assert "### Info — low_bus_factor: PyPI:requests" in md
+
+
+def test_hygiene_dedup_uses_same_grouping():
+    """Hygiene findings collapse on (kind, ecosystem, name, version),
+    same as supply-chain. Verifies the shared helper covers both."""
+    common = dict(
+        ecosystem="npm", name="lodash", version="4.17.20",
+        scope="main", is_lockfile=False,
+        pin_style=PinStyle.RANGE, direct=True,
+        purl="pkg:npm/[email protected]",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+    h_a = HygieneFinding(
+        finding_id="sca:hygiene:loose_pin:npm:lodash:/repo/a.json",
+        kind="loose_pin",                                  # type: ignore[arg-type]
+        dependency=Dependency(declared_in=Path("/repo/a.json"), **common),
+        detail="loose pin",
+        severity="low",                                    # type: ignore[arg-type]
+        confidence=Confidence("high", reason="t"),
+    )
+    h_b = HygieneFinding(
+        finding_id="sca:hygiene:loose_pin:npm:lodash:/repo/b.json",
+        kind="loose_pin",                                  # type: ignore[arg-type]
+        dependency=Dependency(declared_in=Path("/repo/b.json"), **common),
+        detail="loose pin",
+        severity="low",                                    # type: ignore[arg-type]
+        confidence=Confidence("high", reason="t"),
+    )
+    md = render_markdown_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=[], hygiene_findings=[h_a, h_b],
+    )
+    assert md.count("### Low — loose_pin: npm:lodash") == 1
+    assert "Sources (2):" in md
+    assert "/repo/a.json" in md and "/repo/b.json" in md
+
+
+def test_vuln_dedup_collapses_same_dep_same_advisory():
+    """Same vulnerable dep at the same version flagged via the same
+    advisory but declared in two manifests → one section, two
+    sources. Without dedup we'd carry duplicate per-manifest
+    sections that say the same thing about the same CVE."""
+    d_a = _dep(); d_a = Dependency(
+        **{**d_a.__dict__, "declared_in": Path("/repo/a")},
+    )
+    d_b = Dependency(
+        **{**d_a.__dict__, "declared_in": Path("/repo/b")},
+    )
+    adv = _adv("GHSA-X", "high", 7.5)
+    findings = build_vuln_findings(
+        [d_a, d_b],
+        [OsvResult(d_a.key(), [adv]), OsvResult(d_b.key(), [adv])],
+    )
+    md = render_markdown_report(
+        target=Path("/x"), deps_analysed=2,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    assert md.count("### High — lodash 4.17.20") == 1
+    assert "Sources (2):" in md
+    assert "/repo/a" in md and "/repo/b" in md
+
+
+def test_vuln_distinct_advisories_stay_separate():
+    """Same dep + version with TWO different advisories → two
+    sections (one per CVE). Distinct CVEs are different findings."""
+    d = _dep()
+    adv_a = _adv("GHSA-A", "high", 7.5)
+    adv_a.aliases = ["CVE-2099-AAAA"]                  # distinct CVE
+    adv_b = _adv("GHSA-B", "medium", 5.5)
+    adv_b.aliases = ["CVE-2099-BBBB"]                  # distinct CVE
+    findings = build_vuln_findings(
+        [d], [OsvResult(d.key(), [adv_a, adv_b])],
+    )
+    md = render_markdown_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    assert "GHSA-A" in md and "GHSA-B" in md
+
+
+def test_single_source_section_unchanged():
+    """A finding with one source must render identically to the
+    pre-dedup output — no Sources list, just the original Source
+    line. Ensures the dedup change doesn't churn output for
+    operators on small projects with non-duplicating findings."""
+    findings = [_supply_chain(declared_in="/repo/only.txt")]
+    md = render_markdown_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=[], hygiene_findings=[],
+        supply_chain_findings=findings,
+    )
+    assert "Sources (" not in md
+    assert "- Source: `/repo/only.txt`" in md
+
+
 def test_advisory_text_with_ansi_or_bidi_is_sanitised() -> None:
     """OSV-supplied advisory text could carry ANSI escapes or BIDI
     overrides; the renderer must strip them so the markdown is safe to
