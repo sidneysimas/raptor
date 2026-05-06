@@ -124,6 +124,17 @@ def expand_missing_transitives(
             continue
         by_eco_dir.setdefault((m.ecosystem, m.path.parent), []).append(m)
 
+    # Pre-resolution typosquat gate. The cascade resolver will fetch
+    # PyPI / npm / etc. metadata for every name in the manifest — if
+    # one of those names is a confident typosquat (e.g. ``requessts``
+    # for ``requests``), the operator's manifest is pointing at an
+    # attacker-controlled name. We don't want to silently follow
+    # that into ``pip-compile`` resolution: skip cascade for any
+    # (ecosystem, project_dir) whose direct deps include a
+    # typosquat-flagged name. The mechanical-layer typosquat finding
+    # still surfaces; cascade just doesn't compound it.
+    typosquat_dirs = _typosquat_dirs(direct_deps)
+
     # First filter pass: drop entries with sibling lockfile / disabled
     # resolver. Build per-ecosystem work lists for the cascade pass —
     # one resolver per ecosystem can amortise its setup cost (e.g.
@@ -144,6 +155,22 @@ def expand_missing_transitives(
                 manifest=eco_manifests[0].path, ecosystem=eco,
                 method="skipped_resolver_disabled",
                 reason="--no-resolve-transitive set and metadata-walk fallback off",
+            ))
+            continue
+        # Pre-resolution typosquat refusal — the manifest's own deps
+        # include a flagged name. Don't follow into resolver; surface
+        # the reason so operators see why transitives are missing.
+        if (eco, project_dir) in typosquat_dirs:
+            squatted = typosquat_dirs[(eco, project_dir)]
+            statuses.append(TransitiveStatus(
+                manifest=eco_manifests[0].path, ecosystem=eco,
+                method="skipped_typosquat_refused",
+                reason=(
+                    f"manifest declares typosquat-flagged name(s) "
+                    f"({', '.join(sorted(squatted))}); refusing to "
+                    f"query resolver. Fix the typosquat before "
+                    f"re-running."
+                ),
             ))
             continue
         cascade_work.setdefault(eco, []).append(
@@ -170,6 +197,8 @@ def expand_missing_transitives(
         if (eco, project_dir) in lockfile_dirs:
             continue                        # already statused above
         if not enable_resolver and not enable_metadata_fallback:
+            continue                        # already statused above
+        if (eco, project_dir) in typosquat_dirs:
             continue                        # already statused above
 
         added: List[Dependency] = []
@@ -364,6 +393,39 @@ def _try_cascade_batch(
             continue
         tagged = [_with_cascade_source(d, host) for d in deps]
         out.append((pd, host, tagged, None))
+    return out
+
+
+def _typosquat_dirs(
+    direct_deps: Sequence[Dependency],
+) -> Dict[Tuple[str, Path], List[str]]:
+    """Run the existing typosquat detector against direct deps and
+    return ``{(ecosystem, project_dir): [flagged_name, ...]}`` for
+    any (eco, project_dir) tuple whose direct deps include at least
+    one confidently-flagged typosquat. Used to gate the cascade
+    resolver — we don't want pip-compile / npm install fetching
+    metadata for attacker-controlled names.
+
+    The detector is medium-confidence at best (Damerau-Levenshtein
+    distance against a popular-names list), so we additionally
+    require the dep to be ``direct=True`` (operator-declared, not
+    inherited). The manifest-author can correct the typo and
+    re-run; meanwhile cascade staying out keeps the network
+    request from happening at all.
+    """
+    from .supply_chain.typosquat import scan_deps as _typo_scan
+    out: Dict[Tuple[str, Path], List[str]] = {}
+    if not direct_deps:
+        return out
+    findings = _typo_scan(direct_deps)
+    for f in findings:
+        # Only refuse on high-confidence flags. The detector emits
+        # medium for "looks similar to" cases; those should still
+        # surface to the operator but shouldn't block cascade.
+        if f.confidence.level != "high":
+            continue
+        key = (f.dependency.ecosystem, f.dependency.declared_in.parent)
+        out.setdefault(key, []).append(f.dependency.name)
     return out
 
 

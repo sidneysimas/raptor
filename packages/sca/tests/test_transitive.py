@@ -521,3 +521,105 @@ def test_cross_ecosystem_one_crashes_others_proceed(tmp_path, monkeypatch):
     npm = out[("npm", tmp_path / "b")]
     assert npm[0] == []
     assert npm[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Pre-resolution typosquat gate
+# ---------------------------------------------------------------------------
+
+
+def test_typosquat_dep_skips_cascade(tmp_path, monkeypatch):
+    """A direct dep flagged as a confident typosquat causes its
+    (ecosystem, project_dir) to skip the cascade resolver — we don't
+    want pip-compile / npm install fetching metadata for an
+    attacker-controlled name. Status row records the refusal."""
+    from packages.sca.supply_chain.typosquat import TyposquatFinding
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "requirements.txt").write_text("requessts==1.0\n")
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "requessts", "1.0", proj / "requirements.txt")]
+
+    # Stub the typosquat scanner to flag 'requessts' as a HIGH-
+    # confidence squat of 'requests'.
+    def fake_scan(deps):
+        return [
+            TyposquatFinding(
+                dependency=d,
+                nearest_popular="requests",
+                distance=1,
+                severity="medium",
+                confidence=Confidence("high",
+                                       reason="distance=1 from popular"),
+            )
+            for d in deps if d.name == "requessts"
+        ]
+    monkeypatch.setattr(
+        "packages.sca.supply_chain.typosquat.scan_deps", fake_scan,
+    )
+
+    # Stub the resolver too, so if cascade WERE invoked we'd notice
+    # (it would return a fake result instead of raising).
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"requessts==1.0\nrequests==1.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    deps, statuses = expand_missing_transitives(manifests, direct)
+
+    # Cascade was refused — no transitive deps emerged.
+    assert deps == []
+    assert len(statuses) == 1
+    s = statuses[0]
+    assert s.method == "skipped_typosquat_refused"
+    assert "requessts" in (s.reason or "")
+    # And the resolver was NEVER called — the gate fired upstream.
+    fake_resolver.dry_run.assert_not_called()
+
+
+def test_medium_confidence_typosquat_does_not_skip(tmp_path, monkeypatch):
+    """The gate only refuses on HIGH-confidence flags. Medium-confidence
+    ones still surface as findings but don't block cascade — the
+    operator may have a legitimate package with a similar name."""
+    from packages.sca.supply_chain.typosquat import TyposquatFinding
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "requirements.txt").write_text("requestz==1.0\n")
+    manifests = [_manifest("PyPI", proj / "requirements.txt")]
+    direct = [_direct("PyPI", "requestz", "1.0", proj / "requirements.txt")]
+
+    def fake_scan(deps):
+        return [
+            TyposquatFinding(
+                dependency=d, nearest_popular="requests",
+                distance=2, severity="medium",
+                confidence=Confidence("medium", reason="distance=2"),
+            )
+            for d in deps if d.name == "requestz"
+        ]
+    monkeypatch.setattr(
+        "packages.sca.supply_chain.typosquat.scan_deps", fake_scan,
+    )
+
+    fake_resolver = MagicMock()
+    fake_resolver.is_available.return_value = True
+    fake_resolver.dry_run.return_value = ResolverResult(
+        ecosystem="PyPI", success=True, available=True,
+        proposed_lockfile=b"requestz==1.0\n",
+    )
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, project_dir=None: fake_resolver,
+    )
+
+    _, statuses = expand_missing_transitives(manifests, direct)
+    # Medium confidence → cascade still runs (different status).
+    assert statuses[0].method != "skipped_typosquat_refused"
