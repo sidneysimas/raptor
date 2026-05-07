@@ -915,19 +915,128 @@ def parse_shell_script(path: Path) -> List[Dependency]:
 
 
 def parse_gha_workflow(path: Path) -> List[Dependency]:
-    """Extract installs from a GitHub Actions workflow YAML.
+    """Extract installs and ``uses:`` action references from a GHA
+    workflow YAML.
 
-    We don't need a full YAML parser — ``run:`` blocks are recognisable
-    syntactically, and we just need their indented bodies. A best-effort
-    extractor is more robust against the ad-hoc YAML conventions in real
-    workflows than a strict parser anyway.
+    Two extraction passes:
+
+      * ``run:`` block bodies → pip / apt / yum / dnf / apk installs
+        via ``_scan_shell_lines`` with ``source_kind="gha_workflow"``.
+      * ``uses: <owner>/<action>@<ref>`` lines → one Dependency per
+        reference with ``ecosystem="GitHub Actions"``,
+        ``source_kind="gha_uses"``. These flow through OSV CVE
+        matching (the GitHub Actions ecosystem is real) and through
+        the sunset detector (``supply_chain.gha_sunset``) for
+        deprecation / functionality-preservation alerts.
+
+    A workflow can contain both shapes; the parser returns a flat
+    union. We don't need a full YAML parser — both ``run:`` blocks
+    and ``uses:`` lines are recognisable syntactically, and the
+    best-effort extractor is more robust against ad-hoc YAML
+    conventions in real workflows than a strict parser anyway.
     """
     text = _safe_read(path)
     if text is None:
         return []
     runs = _extract_gha_run_blocks(text)
-    return _scan_shell_lines(runs, declared_in=path,
-                             source_kind="gha_workflow")
+    deps = _scan_shell_lines(
+        runs, declared_in=path, source_kind="gha_workflow",
+    )
+    deps.extend(_extract_gha_uses(text, declared_in=path))
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# GHA `uses:` extraction
+# ---------------------------------------------------------------------------
+
+# Match ``uses: owner/repo@ref`` and ``uses: owner/repo/sub@ref``.
+# Skip ``uses: ./local-action`` (no @ref), ``docker://image@digest``
+# (different threat model — Dockerfile FROM scanner covers it).
+_GHA_USES_RE = re.compile(
+    r"""
+    ^\s*-?\s*uses\s*:\s*
+    (?P<spec>[A-Za-z0-9_./-]+@[A-Za-z0-9_./-]+)
+    \s*(?:\#.*)?$
+    """,
+    re.VERBOSE,
+)
+
+_GHA_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _extract_gha_uses(
+    text: str, *, declared_in: Path,
+) -> List[Dependency]:
+    """Pull ``uses: owner/repo@ref`` references out of a workflow.
+
+    Each reference becomes one ``Dependency`` with ecosystem
+    ``"GitHub Actions"``, name ``owner/repo`` (or ``owner/repo/sub``
+    for sub-actions), version equal to the ref, and pin_style
+    classified by ref shape:
+
+      * 40-char hex → GIT (operator's pinning to the action's bytes)
+      * starts with ``v<digit>`` → CARET (semver-tag pin; Action
+        owner can re-publish, but it's the conventional pin shape)
+      * else → UNKNOWN (branch / odd ref)
+    """
+    out: List[Dependency] = []
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        m = _GHA_USES_RE.match(raw)
+        if not m:
+            continue
+        spec = m.group("spec")
+        if spec.startswith(("./", "../", "docker://")):
+            continue
+        if "@" not in spec:
+            continue
+        action, ref = spec.rsplit("@", 1)
+        if "/" not in action:
+            # Bare ``uses: setup-node@v3`` (no owner) — invalid GHA
+            # but seen in copy-pasted snippets. Skip.
+            continue
+        pin_style, version = _classify_action_ref(ref)
+        out.append(Dependency(
+            ecosystem="GitHub Actions",
+            name=action,
+            version=version,
+            declared_in=declared_in,
+            scope="build",
+            is_lockfile=False,
+            pin_style=pin_style,
+            direct=True,
+            purl=f"pkg:githubactions/{action}@{ref}",
+            parser_confidence=Confidence(
+                "high" if pin_style != PinStyle.UNKNOWN else "medium",
+                reason=(
+                    f"GHA uses: {action}@{ref}"
+                ),
+            ),
+            source_kind="gha_uses",
+            source_extra={"ref": ref, "line": line_no},
+        ))
+    return out
+
+
+def _classify_action_ref(ref: str) -> Tuple[PinStyle, Optional[str]]:
+    """Classify a ``uses: <action>@<ref>`` reference.
+
+    ``ref`` is the version-shaped suffix. Mapping:
+
+      * 40-char hex SHA → ``GIT`` pin, version = ref (operator's
+        pinning to the action's bytes; immutable).
+      * ``v1`` / ``v1.2`` / ``v1.2.3`` / ``release-1.0`` → ``CARET``
+        pin, version = ref (semver-tag convention; the action's
+        owner can re-publish the same tag, hence the supply-chain
+        warning from ``gha_drift``, but it's the standard pin
+        shape and the version IS the ref).
+      * Anything else → ``UNKNOWN``, version = ref.
+    """
+    if _GHA_SHA_RE.match(ref.lower()):
+        return PinStyle.GIT, ref
+    if re.match(r"^v?\d", ref) and "/" not in ref:
+        return PinStyle.CARET, ref
+    return PinStyle.UNKNOWN, ref
 
 
 # ---------------------------------------------------------------------------

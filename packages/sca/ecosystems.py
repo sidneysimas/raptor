@@ -14,6 +14,8 @@ KNOWN_ECOSYSTEMS = (
     "RubyGems", "NuGet", "Packagist",
     # C/C++ ecosystems (C14):
     "vcpkg", "ConanCenter",
+    # CI / build pipelines:
+    "GitHub Actions",
 )
 
 _LOOKUP = {e.lower(): e for e in KNOWN_ECOSYSTEMS}

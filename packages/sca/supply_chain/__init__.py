@@ -45,6 +45,7 @@ from ..models import (
 from . import artefacts as _artefacts
 from . import exfil_destinations as _exfil
 from . import gha_drift as _gha_drift
+from . import gha_sunset as _gha_sunset
 from . import git_drift as _git_drift
 from . import install_hooks as _install_hooks
 from . import python_imports as _python_imports
@@ -104,6 +105,12 @@ def evaluate(
 
     for gha in _gha_drift.scan_target(target, manifests_list):
         out.append(_gha_drift_to_finding(gha))
+
+    # Sunset detector consumes the Dependency rows already emitted
+    # by ``parsers.inline_installs.parse_gha_workflow`` (ecosystem
+    # ``"GitHub Actions"``). No additional walk needed; the sunset
+    # check is a pure dep-list filter against the curated list.
+    out.extend(_gha_sunset.scan_dependencies(deps_list))
 
     for gd in _git_drift.scan_deps(deps_list):
         out.append(_git_drift_to_finding(gd))

@@ -270,6 +270,7 @@ SupplyChainKind = Literal[
     "python_import_time_execution",
     "git_tag_drift",
     "gha_action_ref_drift",
+    "gha_action_sunset",
     "version_diff_anomaly",
     "sentinel_match",
 ]
