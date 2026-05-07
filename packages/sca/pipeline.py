@@ -263,7 +263,7 @@ def run_sca(
     #     pipeline as the rest. Skipped under ``--offline`` because
     #     it requires network access to the registry.
     if options.enable_dockerfile_from and not options.offline:
-        from .dockerfile_from import scan_dockerfiles
+        from .dockerfile_from import scan_image_sources
         from core.oci.client import OciRegistryClient
         oci_client = OciRegistryClient(http=http)
         # Cross-run cache for base-image SBOMs. Per-digest entries
@@ -277,12 +277,12 @@ def run_sca(
                 root=(options.cache_root or SCA_CACHE_ROOT) / "dockerfile_from",
             )
         try:
-            base_image_deps = scan_dockerfiles(
+            base_image_deps = scan_image_sources(
                 target, client=oci_client, cache=dockerfile_cache,
             )
         except Exception:                           # noqa: BLE001
             logger.warning(
-                "sca.pipeline: Dockerfile FROM scanning failed",
+                "sca.pipeline: image-source SBOM scanning failed",
                 exc_info=True,
             )
             base_image_deps = []

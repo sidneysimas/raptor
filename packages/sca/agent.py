@@ -133,8 +133,8 @@ def _compose_proxy_hosts(target: Path) -> list:
     hosts = list(SCA_ALLOWED_HOSTS)
     seen = set(hosts)
     try:
-        from .dockerfile_from import dockerfile_registry_hosts
-        for h in dockerfile_registry_hosts(target):
+        from .dockerfile_from import image_source_registry_hosts
+        for h in image_source_registry_hosts(target):
             if h not in seen:
                 hosts.append(h)
                 seen.add(h)
@@ -143,7 +143,7 @@ def _compose_proxy_hosts(target: Path) -> list:
         # sandbox from launching with the static allowlist. The
         # logged exception is sufficient diagnostic.
         logger.warning(
-            "sca.agent: failed to derive Dockerfile registry hosts "
+            "sca.agent: failed to derive image-source registry hosts "
             "for sandbox allowlist", exc_info=True,
         )
     return hosts

@@ -562,6 +562,249 @@ def scan_dockerfiles(
     return deps
 
 
+# ---------------------------------------------------------------------------
+# Image-source unification
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ImageRefSource:
+    """One image reference discovered from any image-source file
+    (Dockerfile FROM, docker-compose ``image:``, GitLab CI ``image:``
+    / ``services:``).
+
+    The unified ``scan_image_sources`` walker dedups by ``image``
+    so the same registry image referenced from multiple sources
+    fetches the SBOM once.
+    """
+    image: str
+    declared_in: Path
+    source_kind: str            # "dockerfile_from" / "compose" / "gitlab_ci"
+    stage_name: Optional[str] = None    # only for Dockerfile multi-stage
+
+
+def find_compose_image_refs(target: Path) -> List[ImageRefSource]:
+    """Walk the target for docker-compose files, extract each
+    service's ``image:`` ref. Skip services that only ``build:``
+    (local build, no registry pull)."""
+    out: List[ImageRefSource] = []
+    try:
+        import yaml
+    except ImportError:
+        return out
+    from .parsers.compose import _is_compose_file
+    for root, dirs, files in os.walk(target):
+        from .discovery import EXCLUDED_DIR_NAMES
+        dirs[:] = [
+            d for d in dirs
+            if d not in EXCLUDED_DIR_NAMES and not d.startswith(".")
+        ]
+        for f in files:
+            p = Path(root) / f
+            if not _is_compose_file(p):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+                data = yaml.safe_load(text)
+            except (OSError, yaml.YAMLError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            services = data.get("services") or {}
+            if not isinstance(services, dict):
+                continue
+            for svc_name, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                image = svc.get("image")
+                if isinstance(image, str) and image.strip():
+                    out.append(ImageRefSource(
+                        image=image.strip(),
+                        declared_in=p,
+                        source_kind="compose",
+                    ))
+    return out
+
+
+def find_gitlab_ci_image_refs(target: Path) -> List[ImageRefSource]:
+    """Walk the target for ``.gitlab-ci.yml`` / ``.gitlab-ci.yaml``,
+    extract every top-level + per-job ``image:`` ref plus
+    ``services:`` array entries."""
+    out: List[ImageRefSource] = []
+    try:
+        import yaml
+    except ImportError:
+        return out
+    from .discovery import EXCLUDED_DIR_NAMES
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [
+            d for d in dirs
+            if d not in EXCLUDED_DIR_NAMES and not d.startswith(".")
+        ]
+        for f in files:
+            if f not in (".gitlab-ci.yml", ".gitlab-ci.yaml"):
+                continue
+            p = Path(root) / f
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+                data = yaml.safe_load(text)
+            except (OSError, yaml.YAMLError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            for image, _ctx in _walk_gitlab_image_refs(data):
+                out.append(ImageRefSource(
+                    image=image, declared_in=p, source_kind="gitlab_ci",
+                ))
+    return out
+
+
+def _walk_gitlab_image_refs(data: dict):
+    """Yield ``(image_ref, context)`` for every image: / services:
+    in a parsed GitLab CI config. Lifted from the parser's logic."""
+    _RESERVED = {
+        "image", "services", "variables", "stages", "default",
+        "include", "before_script", "after_script", "workflow",
+        "cache", "artifacts", "pages", "trigger",
+    }
+
+    def _from(block, label):
+        if not isinstance(block, dict):
+            return
+        image = block.get("image")
+        if isinstance(image, str) and image.strip():
+            yield image.strip(), label
+        elif isinstance(image, dict):
+            name = image.get("name")
+            if isinstance(name, str) and name.strip():
+                yield name.strip(), label
+        services = block.get("services")
+        if isinstance(services, list):
+            for entry in services:
+                if isinstance(entry, str) and entry.strip():
+                    yield entry.strip(), label
+                elif isinstance(entry, dict):
+                    name = entry.get("name")
+                    if isinstance(name, str) and name.strip():
+                        yield name.strip(), label
+
+    yield from _from(data, "top-level")
+    for k, v in data.items():
+        if not isinstance(k, str) or k in _RESERVED:
+            continue
+        if not isinstance(v, dict):
+            continue
+        yield from _from(v, f"job {k}")
+
+
+def find_all_image_refs(target: Path) -> List[ImageRefSource]:
+    """Discover every image reference in the target tree across
+    Dockerfile FROM, docker-compose ``image:``, GitLab CI ``image:``
+    + ``services:``. Output is the flat list — caller dedupes by
+    ``image`` if the SBOM-fetch tier wants only-once semantics."""
+    out: List[ImageRefSource] = []
+    for dockerfile in find_dockerfiles(target):
+        try:
+            text = dockerfile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for entry in extract_from_lines(text):
+            out.append(ImageRefSource(
+                image=entry.image,
+                declared_in=dockerfile,
+                source_kind="dockerfile_from",
+                stage_name=entry.stage_name,
+            ))
+    out.extend(find_compose_image_refs(target))
+    out.extend(find_gitlab_ci_image_refs(target))
+    return out
+
+
+def scan_image_sources(
+    target: Path,
+    *,
+    client: Optional[OciRegistryClient] = None,
+    platform_os: str = "linux",
+    platform_arch: str = "amd64",
+    cache: Optional[Any] = None,
+) -> List[Dependency]:
+    """Discover every image reference under ``target`` (Dockerfiles,
+    docker-compose, GitLab CI), fetch each unique image's OS-package
+    SBOM via ``core.oci``, and return the Dependency rows.
+
+    Same fetcher + cache plumbing as :func:`scan_dockerfiles`, but
+    operates on the union of all OCI image-source files. The
+    Dockerfile-only entry point stays for backwards compatibility
+    + tests; production pipeline calls this.
+
+    Each unique ``image`` ref is fetched once even when referenced
+    from multiple sources (one Dockerfile FROM + one compose
+    service + one GitLab CI image with the same image: postgres:16
+    fetches the SBOM exactly once).
+    """
+    refs = find_all_image_refs(target)
+    if not refs:
+        return []
+
+    if client is None:
+        from core.http import default_client
+        client = OciRegistryClient(http=default_client())
+
+    deps: List[Dependency] = []
+    digest_cache: Dict[str, ImageSbom] = {}
+    seen_images: Dict[str, ImageSbom] = {}
+
+    for ref in refs:
+        sbom = seen_images.get(ref.image)
+        if sbom is None:
+            sbom = fetch_image_sbom(
+                ref.image,
+                client=client,
+                platform_os=platform_os,
+                platform_arch=platform_arch,
+                digest_cache=digest_cache,
+                disk_cache=cache,
+            )
+            if sbom is None:
+                # Mark as known-bad so we don't re-attempt within
+                # this run.
+                seen_images[ref.image] = None      # type: ignore[assignment]
+            else:
+                seen_images[ref.image] = sbom
+        if sbom is None or not sbom.packages:
+            continue
+        deps.extend(packages_to_dependencies(
+            sbom.packages,
+            declared_in=ref.declared_in,
+            image_ref=ref.image,
+            digest=sbom.digest,
+            stage_name=ref.stage_name,
+        ))
+    return deps
+
+
+def image_source_registry_hosts(target: Path) -> List[str]:
+    """Generalisation of :func:`dockerfile_registry_hosts` covering
+    every image-source file. Returns the union of registry
+    hostnames the sandbox must allow for the OCI client to fetch
+    every image referenced in the target — Dockerfile FROM,
+    compose ``image:``, GitLab CI ``image:`` / ``services:``.
+
+    Same best-effort + sorted-output contract."""
+    found: set = set()
+    for ref in find_all_image_refs(target):
+        try:
+            hosts = registry_hosts_for(ref.image)
+        except Exception as e:                      # noqa: BLE001
+            logger.debug(
+                "sca.dockerfile_from: cannot resolve hosts for "
+                "%s in %s: %s", ref.image, ref.declared_in, e,
+            )
+            continue
+        found.update(hosts)
+    return sorted(found)
+
+
 def dockerfile_registry_hosts(target: Path) -> List[str]:
     """Return the union of registry hostnames the sandbox needs to
     allow for every base image referenced in every Dockerfile under
@@ -607,11 +850,17 @@ def dockerfile_registry_hosts(target: Path) -> List[str]:
 
 __all__ = [
     "FromEntry",
+    "ImageRefSource",
     "ImageSbom",
     "dockerfile_registry_hosts",
     "extract_from_lines",
     "fetch_image_sbom",
+    "find_all_image_refs",
+    "find_compose_image_refs",
     "find_dockerfiles",
+    "find_gitlab_ci_image_refs",
+    "image_source_registry_hosts",
     "packages_to_dependencies",
     "scan_dockerfiles",
+    "scan_image_sources",
 ]
