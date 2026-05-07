@@ -217,6 +217,20 @@ def scan(
                 inventory=shared_inventory,
             )
 
+        from .go_function_level import (
+            build_go_symbol_map,
+            refine_go_verdicts,
+        )
+        go_symbols = build_go_symbol_map(osv_results)
+        if go_symbols:
+            shared_inventory = _shared_inventory(target, shared_inventory)
+            refine_go_verdicts(
+                deps_list, out,
+                target=target,
+                go_symbol_map=go_symbols,
+                inventory=shared_inventory,
+            )
+
     return out
 
 

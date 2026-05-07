@@ -370,8 +370,11 @@ def test_go_advisory_symbols_upgrade_to_likely_called(tmp_path: Path) -> None:
     assert out[dep.key()].verdict == "likely_called"
 
 
-def test_go_advisory_symbols_no_match_stays_imported(tmp_path: Path) -> None:
-    """Advisory symbols that don't appear in source: verdict stays imported."""
+def test_go_advisory_symbols_no_match_downgrades(tmp_path: Path) -> None:
+    """Advisory symbols that don't appear in source: the
+    function-level Go tier downgrades verdict from ``imported`` to
+    ``not_function_reachable`` — operator has positive evidence
+    the vulnerable code path isn't exercised."""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "main.go").write_text(
@@ -395,7 +398,7 @@ def test_go_advisory_symbols_no_match_stays_imported(tmp_path: Path) -> None:
         ),
     ]
     out = scan(repo, [dep], osv_results=osv_results)
-    assert out[dep.key()].verdict == "imported"
+    assert out[dep.key()].verdict == "not_function_reachable"
 
 
 def test_go_no_osv_results_falls_back_to_imported(tmp_path: Path) -> None:
