@@ -192,7 +192,11 @@ def run_sca(
     if cache is None:
         cache = JsonCache(root=options.cache_root or SCA_CACHE_ROOT)
     if http is None:
-        http = default_client()
+        # Pass the target so default_client can augment the
+        # allowlist with Dockerfile-derived container-registry
+        # hosts (B9 base-image scanning needs e.g. docker.io,
+        # ghcr.io which aren't in the static SCA_ALLOWED_HOSTS).
+        http = default_client(target=target)
 
     # Apply --no-cache by zeroing TTLs at every client level. This
     # avoids special-casing every caller; a TTL of 0 forces a refetch

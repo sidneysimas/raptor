@@ -118,35 +118,18 @@ def run_sca_subprocess(
 
 
 def _compose_proxy_hosts(target: Path) -> list:
-    """Build the sandbox proxy_hosts allowlist for a SCA run.
+    """Re-export of :func:`packages.sca.compose_proxy_hosts` for the
+    sandbox-subprocess code path.
 
-    Always includes :data:`SCA_ALLOWED_HOSTS` (the static set of
-    OSV / KEV / EPSS / registry-metadata hosts). When the target
-    contains Dockerfiles, also adds the registry hosts for every
-    FROM image — without these the B9 base-image scanner's
-    manifest / blob requests fail at the proxy with a confusing
-    network-unreachable error.
-
-    Order: static set first (deterministic), then the dynamic
-    Dockerfile-derived hosts. Deduplicated by the union.
+    Kept as a thin module-level alias so existing test stubs that
+    monkeypatch ``packages.sca.agent._compose_proxy_hosts`` continue
+    to work. New callers should use the package-level
+    ``packages.sca.compose_proxy_hosts`` directly — same impl, also
+    used by the in-process ``default_client(target)`` seam so both
+    code paths share one allowlist composition.
     """
-    hosts = list(SCA_ALLOWED_HOSTS)
-    seen = set(hosts)
-    try:
-        from .dockerfile_from import image_source_registry_hosts
-        for h in image_source_registry_hosts(target):
-            if h not in seen:
-                hosts.append(h)
-                seen.add(h)
-    except Exception:                               # noqa: BLE001
-        # Best effort: a malformed target shouldn't prevent the
-        # sandbox from launching with the static allowlist. The
-        # logged exception is sufficient diagnostic.
-        logger.warning(
-            "sca.agent: failed to derive image-source registry hosts "
-            "for sandbox allowlist", exc_info=True,
-        )
-    return hosts
+    from packages.sca import compose_proxy_hosts as _impl
+    return _impl(target)
 
 
 # ---------------------------------------------------------------------------

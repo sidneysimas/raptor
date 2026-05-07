@@ -23,6 +23,7 @@ into otherwise-generic ``core.http`` / ``core.json.cache`` machinery:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 from core.http import HttpClient
 from core.http.egress_backend import EgressClient
@@ -75,7 +76,7 @@ SCA_ALLOWED_HOSTS = (
 )
 
 
-def default_client() -> HttpClient:
+def default_client(target: Optional["Path"] = None) -> HttpClient:
     """Return the default HttpClient for /sca.
 
     Always routes through the in-process egress proxy at
@@ -85,16 +86,63 @@ def default_client() -> HttpClient:
     function (or constructing their own EgressClients) all share the
     same proxy and the same allowlist union.
 
+    When ``target`` is provided AND contains Dockerfiles / compose
+    files / GitLab CI configs declaring container image references,
+    the allowlist is augmented with the corresponding container-
+    registry hosts (via :func:`compose_proxy_hosts`). Without this,
+    the B9 base-image scanner fails at the proxy with "host not on
+    allowlist" because ``SCA_ALLOWED_HOSTS`` only covers OSV / KEV /
+    EPSS / static-registry-metadata hosts — not container registries
+    which are project-specific.
+
     Tests bypass this seam by injecting an HttpClient directly via
     dependency injection (``run_sca(..., http=StubHttp(...))``); they
     never trigger proxy startup.
     """
-    return EgressClient(SCA_ALLOWED_HOSTS, user_agent=SCA_USER_AGENT)
+    hosts = compose_proxy_hosts(target) if target is not None \
+        else list(SCA_ALLOWED_HOSTS)
+    return EgressClient(tuple(hosts), user_agent=SCA_USER_AGENT)
+
+
+def compose_proxy_hosts(target: "Optional[Path]" = None) -> list:
+    """Build the proxy_hosts allowlist for a SCA run.
+
+    Always includes :data:`SCA_ALLOWED_HOSTS` (the static set of
+    OSV / KEV / EPSS / registry-metadata hosts). When ``target`` is
+    given AND contains Dockerfiles with FROM image references, also
+    adds the container-registry hosts for every image — required for
+    the B9 base-image scanner's manifest / blob requests.
+
+    Order: static set first (deterministic), then the dynamic
+    image-source-derived hosts. Deduplicated by the union.
+
+    Best-effort: a malformed Dockerfile in the target shouldn't
+    prevent the SCA run from starting with the static allowlist.
+    The discovery failure is logged but not raised.
+    """
+    hosts = list(SCA_ALLOWED_HOSTS)
+    if target is None:
+        return hosts
+    seen = set(hosts)
+    try:
+        from .dockerfile_from import image_source_registry_hosts
+        for h in image_source_registry_hosts(target):
+            if h not in seen:
+                hosts.append(h)
+                seen.add(h)
+    except Exception:                               # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning(
+            "sca: failed to derive image-source registry hosts for "
+            "proxy allowlist", exc_info=True,
+        )
+    return hosts
 
 
 __all__ = [
     "SCA_ALLOWED_HOSTS",
     "SCA_CACHE_ROOT",
     "SCA_USER_AGENT",
+    "compose_proxy_hosts",
     "default_client",
 ]
