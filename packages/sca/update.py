@@ -99,12 +99,26 @@ def main(argv: Sequence[str]) -> int:
         pin_only=args.pin_only,
     )
 
+    # Per-change upgrade-compat risk signals (semver-major bumps,
+    # dep-set churn). Cheap version-string heuristic always; the
+    # network-gated dep-set diff fires only for online runs against
+    # ecosystems we support (currently PyPI).
+    compat_reports = _compute_compat_reports(
+        changes, offline=args.offline,
+        cache_root=Path(args.cache_root) if args.cache_root else None,
+    )
+
     (out_dir / "changes.json").write_text(
-        json.dumps([_change_to_dict(c) for c in changes], indent=2),
+        json.dumps(
+            [_change_to_dict(c, compat_reports.get(_change_key(c)))
+             for c in changes],
+            indent=2,
+        ),
         encoding="utf-8",
     )
     (out_dir / "changes.md").write_text(
-        _render_changes_markdown(changes), encoding="utf-8",
+        _render_changes_markdown(changes, compat_reports),
+        encoding="utf-8",
     )
 
     applied = [c for c in changes if c.skipped_reason is None]
@@ -1422,8 +1436,11 @@ def _emit_git_patch(
     return patch_path, repo_root
 
 
-def _change_to_dict(c: UpgradeChange) -> Dict[str, Any]:
-    return {
+def _change_to_dict(
+    c: UpgradeChange,
+    compat: "Optional[Any]" = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
         "ecosystem": c.ecosystem,
         "name": c.name,
         "old_version": c.old_version,
@@ -1432,9 +1449,87 @@ def _change_to_dict(c: UpgradeChange) -> Dict[str, Any]:
         "advisory_ids": list(c.advisory_ids),
         "skipped_reason": c.skipped_reason,
     }
+    if compat is not None and compat.risks:
+        out["compat_risks"] = [
+            {"kind": r.kind, "severity": r.severity, "detail": r.detail}
+            for r in compat.risks
+        ]
+        out["compat_overall_severity"] = compat.overall_severity
+    return out
 
 
-def _render_changes_markdown(changes: Iterable[UpgradeChange]) -> str:
+def _change_key(c: UpgradeChange) -> Tuple[str, str, str, str]:
+    """Stable identity for a change so multiple manifests bumping the
+    same dep share the same compat report (the risk is per X→Y, not
+    per file)."""
+    return (c.ecosystem, c.name.lower(),
+            c.old_version, c.new_version)
+
+
+def _compute_compat_reports(
+    changes: Iterable[UpgradeChange],
+    *,
+    offline: bool,
+    cache_root: "Optional[Path]" = None,
+) -> Dict[Tuple[str, str, str, str], "Any"]:
+    """Run the api-compat heuristic over every applied change.
+
+    Returns a map of ``_change_key(c) -> UpgradeCompatReport``.
+    Pure version-string analysis (semver bump) is always available;
+    requires_dist-diff is gated on having an HttpClient (skipped in
+    ``--offline``). Only PyPI is wired today; other ecosystems pass
+    through with empty reports.
+    """
+    from .api_compat import check_pypi_api_compat
+
+    out: Dict[Tuple[str, str, str, str], Any] = {}
+    seen_keys: set = set()
+    http = None
+    cache = None
+    if not offline:
+        try:
+            from core.json import JsonCache
+
+            from . import SCA_CACHE_ROOT, default_client
+            http = default_client()
+            cache = JsonCache(root=cache_root or SCA_CACHE_ROOT)
+        except Exception:                             # noqa: BLE001
+            logger.debug("api-compat: HttpClient setup failed; "
+                         "running with semver heuristic only",
+                         exc_info=True)
+            http = None
+            cache = None
+
+    for c in changes:
+        if c.skipped_reason is not None:
+            continue
+        key = _change_key(c)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        if c.ecosystem == "PyPI":
+            out[key] = check_pypi_api_compat(
+                c.name, c.old_version, c.new_version,
+                http=http, cache=cache,
+            )
+        else:
+            # Other ecosystems: only the version-string heuristic is
+            # meaningful, but the per-ecosystem semver convention
+            # differs (npm uses semver strictly; Maven doesn't; Cargo
+            # does). Run the PyPI helper without HTTP — it computes
+            # the semver risk from version strings alone, which IS
+            # universally meaningful enough to surface.
+            out[key] = check_pypi_api_compat(
+                c.name, c.old_version, c.new_version,
+                http=None, cache=None,
+            )
+    return out
+
+
+def _render_changes_markdown(
+    changes: Iterable[UpgradeChange],
+    compat_reports: "Optional[Dict[Tuple[str, str, str, str], Any]]" = None,
+) -> str:
     applied = [c for c in changes if c.skipped_reason is None]
     skipped = [c for c in changes if c.skipped_reason is not None]
     parts: List[str] = ["# raptor-sca fix --cve-only — proposed changes", ""]
@@ -1444,15 +1539,56 @@ def _render_changes_markdown(changes: Iterable[UpgradeChange]) -> str:
     if applied:
         parts.append("## Applied")
         parts.append("")
-        parts.append("| Ecosystem | Name | Old → New | Manifest | Advisories |")
-        parts.append("|---|---|---|---|---|")
+        parts.append(
+            "| Ecosystem | Name | Old → New | Manifest | Advisories | "
+            "Compat |"
+        )
+        parts.append("|---|---|---|---|---|---|")
         for c in applied:
+            compat_cell = "—"
+            if compat_reports is not None:
+                rep = compat_reports.get(_change_key(c))
+                if rep is not None and rep.risks:
+                    compat_cell = (
+                        f"**{rep.overall_severity}** "
+                        f"({len(rep.risks)} signal"
+                        f"{'s' if len(rep.risks) > 1 else ''})"
+                    )
             parts.append(
                 f"| {c.ecosystem} | {c.name} | {c.old_version} → "
                 f"{c.new_version} | `{c.manifest}` | "
-                f"{', '.join(c.advisory_ids) or '—'} |"
+                f"{', '.join(c.advisory_ids) or '—'} | {compat_cell} |"
             )
         parts.append("")
+        # Detail block for any change with non-empty compat risks.
+        risky = []
+        if compat_reports is not None:
+            seen = set()
+            for c in applied:
+                key = _change_key(c)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rep = compat_reports.get(key)
+                if rep is not None and rep.risks:
+                    risky.append((c, rep))
+        if risky:
+            parts.append("### Upgrade-compat risk detail")
+            parts.append("")
+            parts.append(
+                "Heuristic signals that an upgrade may break the build "
+                "or surface compatibility regressions. Review release "
+                "notes before merging changes flagged ``high``."
+            )
+            parts.append("")
+            for c, rep in risky:
+                parts.append(
+                    f"**{c.ecosystem}:{c.name}** "
+                    f"({c.old_version} → {c.new_version})"
+                )
+                for r in rep.risks:
+                    parts.append(f"- _{r.severity}_ — {r.detail}")
+                parts.append("")
     if skipped:
         parts.append("## Skipped")
         parts.append("")

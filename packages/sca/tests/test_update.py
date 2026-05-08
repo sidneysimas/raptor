@@ -391,6 +391,89 @@ def test_findings_missing_returns_2(tmp_path: Path) -> None:
     assert rc == 2
 
 
+# ---------------------------------------------------------------------------
+# api-compat risk surfacing
+# ---------------------------------------------------------------------------
+
+def test_changes_json_carries_compat_risks_for_major_bump(
+    tmp_path: Path,
+) -> None:
+    """A 3.x → 4.x bump is semver-major; the compat heuristic must fire
+    and the JSON output must carry the structured ``compat_risks``
+    entries so downstream consumers (LLM review, PR commenter, CI gate)
+    can read them."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("django==3.2.0\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="3.2.0", fixed_version="4.0.0",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    # ``--allow-major`` because the upgrade crosses 3 → 4; ``--offline``
+    # to keep the test hermetic — semver risk fires from version
+    # strings alone, no PyPI roundtrip needed.
+    update.main([
+        "--findings", str(findings), "--out", str(out),
+        "--allow-major", "--offline",
+    ])
+    changes = json.loads((out / "changes.json").read_text())
+    assert len(changes) == 1
+    assert "compat_risks" in changes[0]
+    risks = changes[0]["compat_risks"]
+    assert any(r["kind"] == "semver_major" and r["severity"] == "high"
+               for r in risks)
+    assert changes[0]["compat_overall_severity"] == "high"
+
+
+def test_changes_md_compat_column_and_detail_block(
+    tmp_path: Path,
+) -> None:
+    """The markdown rendering must surface a Compat column AND a detail
+    block when any change has non-empty risks."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("django==3.2.0\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="3.2.0", fixed_version="4.0.0",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main([
+        "--findings", str(findings), "--out", str(out),
+        "--allow-major", "--offline",
+    ])
+    md = (out / "changes.md").read_text()
+    assert "| Compat |" in md
+    assert "**high**" in md
+    assert "Upgrade-compat risk detail" in md
+    assert "semver-major" in md
+
+
+def test_changes_no_compat_column_value_for_clean_minor_bump(
+    tmp_path: Path,
+) -> None:
+    """When a minor-bump upgrade has no risks, the Compat cell is "—"
+    and no detail block is emitted."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("django==4.2.7\n", encoding="utf-8")
+    findings = _findings_file(tmp_path, [_vuln_row(
+        ecosystem="PyPI", name="django",
+        version="4.2.7", fixed_version="4.2.10",
+        manifest=req,
+    )])
+    out = tmp_path / "out"
+    update.main([
+        "--findings", str(findings), "--out", str(out), "--offline",
+    ])
+    changes = json.loads((out / "changes.json").read_text())
+    # No compat risks → compat_risks key absent.
+    assert "compat_risks" not in changes[0]
+    md = (out / "changes.md").read_text()
+    assert "| — |" in md
+    assert "Upgrade-compat risk detail" not in md
+
+
 def test_offline_and_allow_cascade_are_mutually_exclusive(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:
