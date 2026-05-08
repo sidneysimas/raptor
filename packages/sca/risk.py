@@ -81,35 +81,61 @@ _SCORE_MAX = 100.0
 
 def compute_risk_estimate(
     finding: VulnFinding, dep: Dependency,
+    *,
+    overrides: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """Return ``(score, components)`` for the finding.
 
     ``score`` is a 0..100 float, deterministic from the finding's
     inputs. ``components`` is the breakdown — the CVSS base after
     KEV floor, every multiplier applied in order, and the final
-    clamped score. The ``calibration_status`` key is always set to
-    ``"unverified"`` for now; flip when the calibration corpus is
-    built (see module docstring).
+    clamped score. The ``calibration_status`` key reflects the
+    latest validation report's verdict.
+
+    ``overrides`` is an optional dict mapping named-constant
+    identifiers (``"_KEV_MULTIPLIER"`` etc.) to override values.
+    Used by the calibration refitter
+    (``packages/sca/calibration/refit.py``) to grid-search
+    multiplier values without monkey-patching module state.
+    Default behaviour (``overrides=None``) is unchanged.
     """
+    o = overrides or {}
+    cvss_missing = o.get("_CVSS_MISSING_DEFAULT", _CVSS_MISSING_DEFAULT)
+    kev_floor = o.get("_KEV_FLOOR", _KEV_FLOOR)
+    kev_mult = o.get("_KEV_MULTIPLIER", _KEV_MULTIPLIER)
+    epss_floor = o.get("_EPSS_FLOOR_MULTIPLIER", _EPSS_FLOOR_MULTIPLIER)
+    epss_range = o.get("_EPSS_RANGE_MULTIPLIER", _EPSS_RANGE_MULTIPLIER)
+    epss_missing = o.get("_EPSS_MISSING_DEFAULT", _EPSS_MISSING_DEFAULT)
+    reach_max_red = o.get(
+        "_REACH_NOT_REACHABLE_MAX_REDUCTION",
+        _REACH_NOT_REACHABLE_MAX_REDUCTION,
+    )
+    reach_not_eval = o.get(
+        "_REACH_NOT_EVALUATED_MULTIPLIER", _REACH_NOT_EVALUATED_MULTIPLIER,
+    )
+    expo_floor = o.get("_EXPO_FLOOR_MULTIPLIER", _EXPO_FLOOR_MULTIPLIER)
+    expo_range = o.get("_EXPO_RANGE_MULTIPLIER", _EXPO_RANGE_MULTIPLIER)
+    depth_decay = o.get("_DEPTH_DECAY_BASE", _DEPTH_DECAY_BASE)
+
     components: Dict[str, Any] = {}
 
     # 1. CVSS base — 0-10 → 0-100. Missing → neutral 5.
     cvss = (finding.cvss_score
             if finding.cvss_score is not None
-            else _CVSS_MISSING_DEFAULT)
+            else cvss_missing)
     base = (cvss / 10.0) * 100.0
     components["cvss_base"] = base
 
     # 2. KEV: known-exploited gets a floor + multiplier.
     if finding.in_kev:
-        base = max(base, _KEV_FLOOR) * _KEV_MULTIPLIER
-        components["kev_multiplier"] = _KEV_MULTIPLIER
+        base = max(base, kev_floor) * kev_mult
+        components["kev_multiplier"] = kev_mult
     else:
         components["kev_multiplier"] = 1.0
 
     # 3. EPSS: 0..1 probability mapped onto a 0.30..1.00 multiplier.
-    epss = finding.epss if finding.epss is not None else _EPSS_MISSING_DEFAULT
-    epss_mult = _EPSS_FLOOR_MULTIPLIER + _EPSS_RANGE_MULTIPLIER * epss
+    epss = finding.epss if finding.epss is not None else epss_missing
+    epss_mult = epss_floor + epss_range * epss
     base *= epss_mult
     components["epss_multiplier"] = epss_mult
 
@@ -134,9 +160,9 @@ def compute_risk_estimate(
         #     callers in the static graph; less certain because the
         #     host could still be an unseen entry point.
         conf_numeric = r.confidence.numeric or 0.0
-        reach_mult = 1.0 - _REACH_NOT_REACHABLE_MAX_REDUCTION * conf_numeric
+        reach_mult = 1.0 - reach_max_red * conf_numeric
     elif r.verdict == "not_evaluated":
-        reach_mult = _REACH_NOT_EVALUATED_MULTIPLIER
+        reach_mult = reach_not_eval
     else:                                       # imported / likely_called
         reach_mult = 1.0
     base *= reach_mult
@@ -144,7 +170,7 @@ def compute_risk_estimate(
 
     # 5. Exposure: call-site density normalised within the project.
     expo = max(0.0, min(1.0, finding.exposure_factor))
-    expo_mult = _EXPO_FLOOR_MULTIPLIER + _EXPO_RANGE_MULTIPLIER * expo
+    expo_mult = expo_floor + expo_range * expo
     base *= expo_mult
     components["exposure_multiplier"] = expo_mult
 
@@ -152,7 +178,7 @@ def compute_risk_estimate(
     if dep.direct or finding.transitive_depth <= 0:
         depth_mult = 1.0
     else:
-        depth_mult = _DEPTH_DECAY_BASE ** finding.transitive_depth
+        depth_mult = depth_decay ** finding.transitive_depth
     base *= depth_mult
     components["depth_multiplier"] = depth_mult
 
@@ -171,6 +197,30 @@ def compute_risk_estimate(
     components["calibration_status"] = _calibration_status()
 
     return final, components
+
+
+# Names of the multiplier constants the refitter grid-searches over.
+# Exported so the refitter doesn't have to introspect the module.
+TUNABLE_CONSTANTS = (
+    "_KEV_FLOOR",
+    "_KEV_MULTIPLIER",
+    "_EPSS_FLOOR_MULTIPLIER",
+    "_EPSS_RANGE_MULTIPLIER",
+    "_REACH_NOT_REACHABLE_MAX_REDUCTION",
+    "_REACH_NOT_EVALUATED_MULTIPLIER",
+    "_EXPO_FLOOR_MULTIPLIER",
+    "_EXPO_RANGE_MULTIPLIER",
+    "_DEPTH_DECAY_BASE",
+)
+
+
+def current_constants() -> Dict[str, float]:
+    """Return the current values of all tunable multiplier
+    constants. The refitter compares its proposed values against
+    these."""
+    return {
+        name: globals()[name] for name in TUNABLE_CONSTANTS
+    }
 
 
 # ---------------------------------------------------------------------------
