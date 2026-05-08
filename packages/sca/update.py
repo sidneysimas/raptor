@@ -229,21 +229,27 @@ def _run_cascade_validation(
 ) -> None:
     """Per-ecosystem resolver pass over the proposed manifests.
 
-    Groups applied changes by ecosystem; runs each ecosystem's resolver
-    against the corresponding proposed manifest in ``out_dir/proposed``.
+    Groups applied changes by ecosystem; for each ecosystem, runs the
+    matching resolver against the corresponding proposed manifest in
+    ``out_dir/proposed``. Ecosystems are resolved in parallel via a
+    thread pool — each resolver call sleeps on its sandbox subprocess,
+    so threading buys real wallclock for polyglot upgrade plans
+    (npm + PyPI + Go each ~5-10s; sequential = ~25s; parallel = the
+    slowest one, ~10s). Same pattern as ``transitive._run_cascades_
+    parallel``.
+
     Reports OK / conflict per ecosystem; the resolver's lockfile (when
     it produces one) is captured for follow-up consumers.
     """
-    from .resolvers import get_resolver
     by_eco: Dict[str, List[UpgradeChange]] = defaultdict(list)
     for c in applied:
         by_eco[c.ecosystem].append(c)
     proposed_root = out_dir / "proposed"
-    summary: List[Dict[str, Any]] = []
+
+    # Resolve eco_root per ecosystem first (sequential — pure path
+    # manipulation, no I/O).
+    work_items: List[Tuple[str, Path]] = []
     for eco, changes in by_eco.items():
-        # Find the project sub-directory inside ``proposed/`` to run
-        # against. We look at the first change's manifest's parent and
-        # mirror that under ``proposed/``.
         first_manifest = changes[0].manifest
         try:
             rel_parent = first_manifest.parent.relative_to(Path.cwd())
@@ -252,30 +258,10 @@ def _run_cascade_validation(
         eco_root = (proposed_root / rel_parent).resolve()
         if not eco_root.exists():
             eco_root = proposed_root
-        # Pass eco_root so multi-tool ecosystems (npm/yarn/pnpm,
-        # pip/poetry, Maven/Gradle) pick the resolver matching the
-        # project's actual lockfile/config.
-        resolver = get_resolver(eco, project_dir=eco_root)
-        if resolver is None:
-            summary.append({"ecosystem": eco, "verdict": "unsupported",
-                             "reason": "no resolver wrapper for ecosystem"})
-            continue
-        if not resolver.is_available():
-            summary.append({"ecosystem": eco, "verdict": "skipped",
-                             "reason": f"{eco} toolchain not in PATH"})
-            continue
-        result = resolver.dry_run(eco_root)
-        summary.append({
-            "ecosystem": eco,
-            "verdict": "ok" if result.success else "conflict",
-            "error": result.error,
-        })
-        if result.proposed_lockfile is not None:
-            lockfile_dest = out_dir / f"cascade-{eco.lower()}.lock"
-            try:
-                lockfile_dest.write_bytes(result.proposed_lockfile)
-            except OSError:
-                pass
+        work_items.append((eco, eco_root))
+
+    summary = _validate_ecosystems_parallel(work_items, out_dir)
+
     (out_dir / "cascade.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8",
     )
@@ -284,6 +270,88 @@ def _run_cascade_validation(
     print(f"raptor-sca fix --cve-only --allow-cascade: {oks} ecosystem(s) resolve "
           f"cleanly; {conflicts} have conflicts. Plan: "
           f"{out_dir}/cascade.json")
+
+
+def _validate_ecosystems_parallel(
+    work_items: List[Tuple[str, Path]], out_dir: Path,
+) -> List[Dict[str, Any]]:
+    """Dispatch resolver dry-run per ecosystem in parallel.
+
+    Each thread calls one resolver subprocess inside its own sandbox
+    session — no shared mutable state across threads. Returns
+    summary rows in the SAME order as ``work_items`` (input order
+    preservation makes diffs against the previous sequential output
+    deterministic).
+
+    Defensive: a buggy resolver subprocess that raises rather than
+    returning a result fails just that ecosystem with verdict=
+    "error"; other ecosystems still report. Matches the pattern in
+    ``transitive._run_cascades_parallel``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not work_items:
+        return []
+
+    results: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=max(1, len(work_items)),
+        thread_name_prefix="sca-cascade-validate",
+    ) as pool:
+        futs = {
+            pool.submit(_validate_one_ecosystem, eco, eco_root, out_dir): eco
+            for eco, eco_root in work_items
+        }
+        for fut in futs:
+            eco = futs[fut]
+            try:
+                results[eco] = fut.result()
+            except Exception as e:                       # noqa: BLE001
+                logger.warning(
+                    "sca.update: cascade validation crashed for %s: %s",
+                    eco, e,
+                )
+                results[eco] = {
+                    "ecosystem": eco, "verdict": "error",
+                    "reason": f"resolver thread crashed: {e}",
+                }
+    return [results[eco] for eco, _ in work_items]
+
+
+def _validate_one_ecosystem(
+    eco: str, eco_root: Path, out_dir: Path,
+) -> Dict[str, Any]:
+    """Per-ecosystem cascade body. Runs one resolver dry-run +
+    captures its lockfile if present. Returns the summary row.
+    """
+    from .resolvers import get_resolver
+    # Pass eco_root so multi-tool ecosystems (npm/yarn/pnpm,
+    # pip/poetry, Maven/Gradle) pick the resolver matching the
+    # project's actual lockfile/config.
+    resolver = get_resolver(eco, project_dir=eco_root)
+    if resolver is None:
+        return {
+            "ecosystem": eco, "verdict": "unsupported",
+            "reason": "no resolver wrapper for ecosystem",
+        }
+    if not resolver.is_available():
+        return {
+            "ecosystem": eco, "verdict": "skipped",
+            "reason": f"{eco} toolchain not in PATH",
+        }
+    result = resolver.dry_run(eco_root)
+    row = {
+        "ecosystem": eco,
+        "verdict": "ok" if result.success else "conflict",
+        "error": result.error,
+    }
+    if result.proposed_lockfile is not None:
+        lockfile_dest = out_dir / f"cascade-{eco.lower()}.lock"
+        try:
+            lockfile_dest.write_bytes(result.proposed_lockfile)
+        except OSError:
+            pass
+    return row
 
 
 def _run_external_validation(manifest: Path, out_dir: Path) -> None:

@@ -494,3 +494,283 @@ def test_offline_and_allow_cascade_are_mutually_exclusive(
     err = capsys.readouterr().err
     assert "mutually exclusive" in err
     assert "--offline" in err and "--allow-cascade" in err
+
+
+# ---------------------------------------------------------------------------
+# Cascade validation (parallel per-ecosystem dispatch)
+# ---------------------------------------------------------------------------
+
+
+class _StubResolver:
+    """Minimal Resolver stub for cascade tests.
+
+    ``available`` / ``success`` / ``error`` / ``proposed_lockfile``
+    drive the verdict. ``barrier`` (when supplied) lets multiple
+    threads synchronise so we can verify the resolvers actually run
+    concurrently.
+    """
+
+    def __init__(
+        self, *, available=True, success=True, error=None,
+        proposed_lockfile=None, barrier=None,
+    ):
+        self._available = available
+        self._success = success
+        self._error = error
+        self._lockfile = proposed_lockfile
+        self._barrier = barrier
+        self.dry_run_calls = []
+
+    def is_available(self):
+        return self._available
+
+    def dry_run(self, project_dir, *, timeout=120):
+        if self._barrier is not None:
+            # Block until all threads reach this point — proves
+            # concurrent execution.
+            self._barrier.wait(timeout=5)
+        self.dry_run_calls.append(project_dir)
+        # Build a fake ResolverResult — duck-typed to what
+        # _validate_one_ecosystem reads.
+        from packages.sca.resolvers import ResolverResult
+        return ResolverResult(
+            ecosystem="stub",
+            success=self._success,
+            available=self._available,
+            error=self._error,
+            proposed_lockfile=self._lockfile,
+        )
+
+
+def _make_proposed(tmp_path: Path, eco_to_files: dict) -> Path:
+    """Build a tmp_path/out/proposed/ tree mirroring the CWD-relative
+    layout the cascade expects."""
+    out = tmp_path / "out"
+    proposed = out / "proposed"
+    proposed.mkdir(parents=True, exist_ok=True)
+    for eco_path, content in eco_to_files.items():
+        target = proposed / eco_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return out
+
+
+def _make_change(
+    *, ecosystem: str, name: str = "pkg", manifest: Path,
+) -> "update.UpgradeChange":
+    return update.UpgradeChange(
+        ecosystem=ecosystem, name=name,
+        old_version="1.0.0", new_version="1.0.1",
+        manifest=manifest,
+        advisory_ids=("GHSA-x",),
+    )
+
+
+def test_cascade_parallel_runs_resolver_per_ecosystem(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """All ecosystems get their resolver invoked. Result count
+    matches input ecosystem count."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    npm_resolver = _StubResolver()
+    pypi_resolver = _StubResolver()
+    go_resolver = _StubResolver()
+
+    def fake_get_resolver(eco, *, project_dir):
+        return {
+            "npm": npm_resolver,
+            "PyPI": pypi_resolver,
+            "Go": go_resolver,
+        }.get(eco)
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+        _make_change(ecosystem="Go", manifest=cwd / "go.mod"),
+    ]
+    update._run_cascade_validation(applied, out)
+
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert len(cascade) == 3
+    ecos = {row["ecosystem"] for row in cascade}
+    assert ecos == {"npm", "PyPI", "Go"}
+    # Each resolver got exactly one dry_run call.
+    assert len(npm_resolver.dry_run_calls) == 1
+    assert len(pypi_resolver.dry_run_calls) == 1
+    assert len(go_resolver.dry_run_calls) == 1
+
+
+def test_cascade_resolver_crash_isolates_to_one_ecosystem(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A resolver subprocess that raises rather than returning a
+    result fails just THAT ecosystem with verdict='error'; other
+    ecosystems still report cleanly."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    class _CrashingResolver(_StubResolver):
+        def dry_run(self, project_dir, *, timeout=120):
+            raise RuntimeError("simulated crash")
+
+    crashing = _CrashingResolver()
+    healthy = _StubResolver()
+
+    def fake_get_resolver(eco, *, project_dir):
+        return {"npm": crashing, "PyPI": healthy}.get(eco)
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+    ]
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    rows = {r["ecosystem"]: r for r in cascade}
+    assert rows["npm"]["verdict"] == "error"
+    assert "simulated crash" in rows["npm"]["reason"]
+    assert rows["PyPI"]["verdict"] == "ok"
+
+
+def test_cascade_unsupported_and_skipped_verdicts(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """No resolver registered → unsupported. Resolver present but
+    tool not in PATH → skipped."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    unavailable_resolver = _StubResolver(available=False)
+
+    def fake_get_resolver(eco, *, project_dir):
+        if eco == "Maven":
+            return None       # unsupported
+        if eco == "PyPI":
+            return unavailable_resolver
+        return None
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="Maven", manifest=cwd / "pom.xml"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+    ]
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    rows = {r["ecosystem"]: r for r in cascade}
+    assert rows["Maven"]["verdict"] == "unsupported"
+    assert rows["PyPI"]["verdict"] == "skipped"
+    assert "PATH" in rows["PyPI"]["reason"]
+
+
+def test_cascade_lockfile_capture(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When a resolver returns a proposed_lockfile, it gets written
+    under cascade-<eco>.lock with the right contents."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    resolver = _StubResolver(proposed_lockfile=b"lockfile-bytes")
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, *, project_dir: resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+    ]
+    update._run_cascade_validation(applied, out)
+    lockfile_path = out / "cascade-npm.lock"
+    assert lockfile_path.exists()
+    assert lockfile_path.read_bytes() == b"lockfile-bytes"
+
+
+def test_cascade_preserves_input_order_in_summary(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """cascade.json rows come back in the same ecosystem order as
+    by_eco's keys (which preserve insertion order from ``applied``).
+    Important so diffs against the previous sequential implementation
+    are deterministic."""
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, *, project_dir: _StubResolver(),
+    )
+
+    applied = [
+        _make_change(ecosystem="Go", manifest=cwd / "go.mod"),
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+    ]
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert [row["ecosystem"] for row in cascade] == ["Go", "npm", "PyPI"]
+
+
+def test_cascade_threads_run_concurrently(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Three resolvers all rendezvous at a barrier — proves the
+    thread pool genuinely runs them in parallel rather than
+    serialising."""
+    import threading
+    cwd = Path.cwd()
+    out = _make_proposed(tmp_path, {})
+
+    barrier = threading.Barrier(3, timeout=5)
+    resolvers = [_StubResolver(barrier=barrier) for _ in range(3)]
+
+    def fake_get_resolver(eco, *, project_dir):
+        return {
+            "npm": resolvers[0],
+            "PyPI": resolvers[1],
+            "Go": resolvers[2],
+        }.get(eco)
+
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver", fake_get_resolver,
+    )
+
+    applied = [
+        _make_change(ecosystem="npm", manifest=cwd / "package.json"),
+        _make_change(ecosystem="PyPI", manifest=cwd / "requirements.txt"),
+        _make_change(ecosystem="Go", manifest=cwd / "go.mod"),
+    ]
+    # If the implementation were sequential, the barrier would never
+    # release (only one thread ever arrives at a time), and dry_run
+    # would raise BrokenBarrierError on timeout. Successful
+    # completion proves concurrent execution.
+    update._run_cascade_validation(applied, out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert len(cascade) == 3
+    assert all(r["verdict"] == "ok" for r in cascade)
+
+
+def test_cascade_empty_applied_no_op(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Defensive: empty input → empty cascade.json, no exceptions."""
+    out = _make_proposed(tmp_path, {})
+    monkeypatch.setattr(
+        "packages.sca.resolvers.get_resolver",
+        lambda eco, *, project_dir: _StubResolver(),
+    )
+    update._run_cascade_validation([], out)
+    cascade = json.loads((out / "cascade.json").read_text())
+    assert cascade == []
