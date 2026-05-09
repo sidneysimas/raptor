@@ -560,3 +560,136 @@ def test_exploit_evidence_floor_lifts_low_cvss_finding():
         f"floor should ~triple a low-CVSS score when exploit evidence "
         f"is present (no_ee={s_no:.2f}, with_ee={s_yes:.2f})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Constraint-aware refit support — bounds + cross-constraints
+# ---------------------------------------------------------------------------
+
+
+class TestAdmissibility:
+    """Constraint-aware refit gates."""
+
+    def test_baseline_constants_are_admissible(self):
+        from packages.sca.risk import current_constants, is_admissible
+        ok, reason = is_admissible(current_constants())
+        assert ok, f"shipped constants should be admissible: {reason}"
+
+    def test_negative_multiplier_rejected(self):
+        from packages.sca.risk import current_constants, is_admissible
+        bad = current_constants()
+        bad["_KEV_MULTIPLIER"] = -0.5
+        ok, reason = is_admissible(bad)
+        assert not ok
+        assert "_KEV_MULTIPLIER" in reason
+
+    def test_floor_above_100_rejected(self):
+        from packages.sca.risk import current_constants, is_admissible
+        bad = current_constants()
+        bad["_KEV_FLOOR"] = 150.0
+        ok, reason = is_admissible(bad)
+        assert not ok
+        assert "_KEV_FLOOR" in reason
+
+    def test_not_evaluated_above_one_rejected(self):
+        """Design intent: not_evaluated is a small PENALTY (< 1).
+        A search that proposes turning it into a bonus must be
+        filtered."""
+        from packages.sca.risk import current_constants, is_admissible
+        bad = current_constants()
+        bad["_REACH_NOT_EVALUATED_MULTIPLIER"] = 1.05
+        ok, reason = is_admissible(bad)
+        assert not ok
+        assert "_REACH_NOT_EVALUATED_MULTIPLIER" in reason
+
+    def test_ee_multiplier_at_or_above_kev_rejected(self):
+        """Cross-constraint: EDB / MSF / PoC are weaker signals
+        than KEV — their multiplier must stay strictly below
+        KEV's, otherwise a non-KEV PoC would outrank a KEV vuln
+        on tied CVSS, breaking the documented precedence."""
+        from packages.sca.risk import current_constants, is_admissible
+        bad = current_constants()
+        bad["_EXPLOIT_EVIDENCE_MULTIPLIER"] = bad["_KEV_MULTIPLIER"]
+        ok, reason = is_admissible(bad)
+        assert not ok
+        assert "exploit_evidence_strictly_below_kev" in reason
+
+    def test_ee_floor_above_kev_floor_rejected(self):
+        from packages.sca.risk import current_constants, is_admissible
+        bad = current_constants()
+        bad["_EXPLOIT_EVIDENCE_FLOOR"] = bad["_KEV_FLOOR"] + 1.0
+        ok, reason = is_admissible(bad)
+        assert not ok
+        assert "exploit_evidence_strictly_below_kev" in reason
+
+
+class TestRefitConstraintGate:
+    """End-to-end test that constraint-aware refit drops bad
+    candidates from the per-constant grid search."""
+
+    def test_inadmissible_candidate_dropped_from_search(self, tmp_path):
+        """At ±50% delta the search would propose
+        _REACH_NOT_EVALUATED_MULTIPLIER above 1.0; with constraint-
+        aware refit, that candidate must be dropped and the
+        constant left at its current value."""
+        # Build a tiny corpus: 5 findings, 1 exploited.
+        import json
+        signal_dir = tmp_path / "kev_signals.json"
+        signal_dir.write_text(json.dumps({
+            "signals": {"CVE-FAKE-1": {}},
+        }))
+        samples = tmp_path / "project_samples" / "X" / "p.json"
+        samples.parent.mkdir(parents=True)
+        findings = [
+            {"finding_id": f"f{i}",
+             "raptor_risk_estimate": 100.0 - i,
+             "advisory": {"aliases": [f"CVE-FAKE-{i}"]},
+             "in_kev": False, "epss": 0.5, "cvss_score": 5.0,
+             "ecosystem": "X",
+             "dependency": {"ecosystem": "X", "name": "p",
+                             "version": "1.0", "direct": True,
+                             "parser_confidence": {"level": "high",
+                                                    "reason": "",
+                                                    "numeric": 0.95}},
+             "reachability": {"verdict": "not_evaluated",
+                               "confidence": {"level": "low",
+                                               "reason": "",
+                                               "numeric": 0.5},
+                               "evidence": []},
+             "version_match_confidence": {"level": "high",
+                                           "reason": "",
+                                           "numeric": 0.95},
+             "exposure_factor": 0.0,
+             "transitive_depth": 0,
+             "severity": "medium",
+             "exploit_evidence": {"kev_listed": False,
+                                   "edb_ids": [], "msf_modules": [],
+                                   "github_poc_urls": [],
+                                   "has_any": False}}
+            for i in range(5)
+        ]
+        samples.write_text(json.dumps({"findings": findings}))
+
+        from packages.sca.calibration.refit import grid_search_refit
+        report = grid_search_refit(
+            tmp_path, max_delta=0.50,
+            min_samples=1,
+        )
+        # _REACH_NOT_EVALUATED_MULTIPLIER must NOT have been moved
+        # to >1.0 — find the per-constant entry for it.
+        entry = next(
+            c for c in report.per_constant
+            if c.name == "_REACH_NOT_EVALUATED_MULTIPLIER"
+        )
+        assert entry.proposed <= 1.0, (
+            f"refit proposed _REACH_NOT_EVALUATED_MULTIPLIER="
+            f"{entry.proposed} which violates the 'small penalty'"
+            f" design constraint"
+        )
+        # The rejection should be recorded in notes.
+        rejection_notes = [n for n in report.notes if "rejected" in n]
+        assert any("_REACH_NOT_EVALUATED_MULTIPLIER" in n
+                    for n in rejection_notes), (
+            f"expected a rejection note for _REACH_NOT_EVALUATED_MULTIPLIER; "
+            f"got: {rejection_notes}"
+        )

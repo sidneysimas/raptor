@@ -27,7 +27,7 @@ dict, the 0-100 range, the sort order).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import Dependency, VulnFinding
 
@@ -60,7 +60,12 @@ _KEV_MULTIPLIER = 1.20
 # multiplier is smaller for the same reason — EDB/MSF/PoC are weaker
 # signals than active CISA-tracked exploitation.
 _EXPLOIT_EVIDENCE_FLOOR = 60.0
-_EXPLOIT_EVIDENCE_MULTIPLIER = 1.21
+# Strictly below `_KEV_MULTIPLIER` — pinned by `is_admissible`'s
+# `exploit_evidence_strictly_below_kev` rule. A previous refit
+# pass set this to 1.21 which crossed KEV's 1.20; round-2 with
+# constraint-aware refit caught the violation. If KEV_MULT moves
+# later this constant has headroom to follow.
+_EXPLOIT_EVIDENCE_MULTIPLIER = 1.19
 
 # EPSS — exploit probability in the wild. Even a 0% EPSS leaves 30%
 # weight (a vuln with no observed exploitation isn't impossible to
@@ -259,6 +264,90 @@ def current_constants() -> Dict[str, float]:
     return {
         name: globals()[name] for name in TUNABLE_CONSTANTS
     }
+
+
+# Per-constant absolute bounds. Refit rejects candidates outside
+# these — so a wider --max-delta can't propose values that violate
+# the design intent of each multiplier. The bounds encode physical
+# constraints (positive multipliers, score-range floors) AND
+# design intent that's too easy to drift past in a maximise-metric
+# search:
+#
+#   * `_REACH_NOT_EVALUATED_MULTIPLIER` is a "small penalty for
+#     unknown reachability"; capped < 1.0 so the search can't turn
+#     it into a bonus that rewards lack-of-evidence.
+#   * `_REACH_NOT_REACHABLE_MAX_REDUCTION` is the ceiling on how
+#     much a confidently-not-reachable verdict can shrink a score;
+#     capped 0.0..1.0.
+#   * Floors are absolute score offsets (0..100); their multiplier
+#     siblings are positive ratios.
+#
+# Refit's existing per-constant grid search filters candidates
+# against these bounds. Cross-constant constraints (e.g.
+# EXPLOIT_EVIDENCE_MULTIPLIER must stay < KEV_MULTIPLIER) live in
+# `CROSS_CONSTRAINTS` below.
+CONSTANT_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "_KEV_FLOOR":                          (0.0, 100.0),
+    "_KEV_MULTIPLIER":                     (1.0,   3.0),
+    "_EXPLOIT_EVIDENCE_FLOOR":             (0.0, 100.0),
+    "_EXPLOIT_EVIDENCE_MULTIPLIER":        (1.0,   3.0),
+    "_EPSS_FLOOR_MULTIPLIER":              (0.0,   1.0),
+    "_EPSS_RANGE_MULTIPLIER":              (0.0,   1.0),
+    "_REACH_NOT_REACHABLE_MAX_REDUCTION":  (0.0,   1.0),
+    "_REACH_NOT_EVALUATED_MULTIPLIER":     (0.0,   1.0),
+    "_EXPO_FLOOR_MULTIPLIER":              (0.0,   1.0),
+    "_EXPO_RANGE_MULTIPLIER":              (0.0,   1.0),
+    "_DEPTH_DECAY_BASE":                   (0.0,   1.0),
+}
+
+
+# Cross-constant constraints. Each entry is a (name, predicate)
+# pair where predicate receives the candidate-overrides dict
+# (constant-name → value) and returns True iff the candidate is
+# admissible. Refit filters proposals that fail any predicate.
+#
+# Naming convention: predicates are NAMED by the design rule they
+# enforce so a refit-report's rejection note is human-readable.
+def _ee_strictly_below_kev(values: Dict[str, float]) -> bool:
+    """EDB / MSF / PoC are weaker exploit signals than KEV
+    (CISA-tracked active exploitation). The multiplier must stay
+    strictly below KEV's, and the floor at most equal — otherwise
+    a non-KEV PoC could outrank a KEV vuln on tied CVSS, breaking
+    the documented precedence in the score function."""
+    ee_mult = values.get("_EXPLOIT_EVIDENCE_MULTIPLIER",
+                          _EXPLOIT_EVIDENCE_MULTIPLIER)
+    kev_mult = values.get("_KEV_MULTIPLIER", _KEV_MULTIPLIER)
+    ee_floor = values.get("_EXPLOIT_EVIDENCE_FLOOR",
+                           _EXPLOIT_EVIDENCE_FLOOR)
+    kev_floor = values.get("_KEV_FLOOR", _KEV_FLOOR)
+    return ee_mult < kev_mult and ee_floor <= kev_floor
+
+
+CROSS_CONSTRAINTS: List[Tuple[str, Any]] = [
+    ("exploit_evidence_strictly_below_kev", _ee_strictly_below_kev),
+]
+
+
+def is_admissible(values: Dict[str, float]) -> Tuple[bool, Optional[str]]:
+    """Check absolute bounds + cross-constraints on a candidate.
+
+    Returns ``(True, None)`` when admissible; ``(False, reason)``
+    naming the first failed rule. Refit calls this on every
+    candidate variant before evaluating its precision.
+    """
+    for name, value in values.items():
+        bounds = CONSTANT_BOUNDS.get(name)
+        if bounds is None:
+            continue
+        lo, hi = bounds
+        if not (lo <= value <= hi):
+            return False, f"{name}={value!r} outside bounds [{lo}, {hi}]"
+    for rule_name, predicate in CROSS_CONSTRAINTS:
+        if not predicate(values):
+            return False, f"cross-constraint violated: {rule_name}"
+    return True, None
+
+
 
 
 # ---------------------------------------------------------------------------

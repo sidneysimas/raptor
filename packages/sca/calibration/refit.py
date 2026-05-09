@@ -222,7 +222,7 @@ def grid_search_refit(
         )
 
     from packages.sca.risk import (
-        TUNABLE_CONSTANTS, current_constants,
+        TUNABLE_CONSTANTS, current_constants, is_admissible,
     )
     current = current_constants()
 
@@ -235,36 +235,78 @@ def grid_search_refit(
 
     # Per-constant search. Each candidate runs in isolation against
     # the live formula (all other constants at their current values).
+    # Admissibility check filters candidates that violate the bounds
+    # or cross-constraints declared in risk.py — without it, a
+    # wider --max-delta would happily propose values that maximise
+    # top-20 on this corpus by violating design intent (e.g. EE_MULT
+    # crossing KEV_MULT, NOT_EVALUATED becoming a bonus instead of
+    # penalty). Inadmissible candidates produce a precision of -inf
+    # so they're never picked even when they'd numerically maximise.
     per_constant: List[ConstantRefit] = []
     for name in TUNABLE_CONSTANTS:
         cur = current[name]
         candidates = [
-            cur,                  # no change
+            cur,                  # no change — always admissible
             cur * (1.0 - max_delta),
             cur * (1.0 + max_delta),
         ]
-        precisions = [
-            _top_20_precision(samples, overrides={name: c})
-            for c in candidates
-        ]
+        precisions: List[float] = []
+        for c in candidates:
+            full_values = {**current, name: c}
+            ok, _reason = is_admissible(full_values)
+            if not ok:
+                # Use -inf so this candidate is never chosen by argmax,
+                # even when its numeric precision would have been the
+                # highest. Recorded in `notes` below for transparency.
+                precisions.append(float("-inf"))
+            else:
+                precisions.append(
+                    _top_20_precision(samples, overrides={name: c})
+                )
         # Pick the highest precision; tie → keep current (index 0).
         best_idx = max(range(3), key=lambda i: precisions[i])
         if precisions[best_idx] <= precisions[0]:
             best_idx = 0
+        # Note inadmissible rejections so the report is honest about
+        # which candidate was filtered (and why), rather than silently
+        # picking the second-best.
+        for idx, c in enumerate(candidates):
+            if idx == 0:
+                continue
+            if precisions[idx] == float("-inf"):
+                _ok, reason = is_admissible({**current, name: c})
+                notes.append(
+                    f"{name}={c:.4g} rejected: {reason}"
+                )
         per_constant.append(ConstantRefit(
             name=name,
             current=cur,
             proposed=candidates[best_idx],
-            baseline_precision=precisions[0],
-            proposed_precision=precisions[best_idx],
+            baseline_precision=precisions[0]
+                if precisions[0] != float("-inf") else 0.0,
+            proposed_precision=precisions[best_idx]
+                if precisions[best_idx] != float("-inf") else 0.0,
         ))
 
     # Compose all proposed overrides and re-score. Per-constant
     # improvements may not stack additively; this is the joint
-    # effect.
+    # effect. The composed candidate must ALSO pass admissibility
+    # — a per-constant search picks each constant in isolation, so
+    # a cross-constraint that's only violated when TWO constants
+    # both move in the same direction would slip past the per-
+    # constant gate. Joint admissibility check catches that.
     joint_overrides = {
         c.name: c.proposed for c in per_constant if c.changed
     }
+    if joint_overrides:
+        joint_full = {**current, **joint_overrides}
+        ok_joint, joint_reason = is_admissible(joint_full)
+        if not ok_joint:
+            notes.append(
+                f"joint composition rejected: {joint_reason}; "
+                f"falling back to baseline"
+            )
+            joint_overrides = {}
     joint_precision = (
         _top_20_precision(samples, overrides=joint_overrides)
         if joint_overrides else baseline
