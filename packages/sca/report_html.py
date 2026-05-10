@@ -75,6 +75,15 @@ def render_html_report(
         key=lambda f: (-severity_rank(f.severity), f.kind, f.dependency.name),
     )
 
+    # Auto-populate the ecosystem dropdown from the actual deps
+    # in the report (rather than hard-coding the 8 known
+    # ecosystems) so the dropdown only shows what the operator
+    # has to triage.
+    ecosystems = sorted({
+        f.dependency.ecosystem
+        for f in (*sorted_vulns, *sorted_supply,
+                   *sorted_license, *sorted_hygiene)
+    })
     parts = [
         _doctype(),
         _head(target),
@@ -88,6 +97,7 @@ def render_html_report(
             license_findings=sorted_license,
             cache_hits=cache_hits, cache_misses=cache_misses,
         ),
+        _filter_bar(ecosystems),
     ]
     if sorted_vulns:
         parts.append(_vuln_section(sorted_vulns))
@@ -110,6 +120,7 @@ def render_html_report(
             "hygiene, supply-chain, or license issues detected for "
             "the analysed dependency set.</p></section>"
         )
+    parts.append(_FILTER_SCRIPT)
     parts.append("</body></html>")
     return "\n".join(parts)
 
@@ -237,8 +248,26 @@ def _vuln_section(findings: Sequence[VulnFinding]) -> str:
 def _vuln_card(f: VulnFinding) -> str:
     dep = f.dependency
     primary = f.advisories[0] if f.advisories else None
+    # data-* attributes feed the interactive filter bar (see
+    # ``_filter_bar`` / ``_FILTER_SCRIPT``). Each card exposes the
+    # discriminators the operator filters on; ``data-search`` is a
+    # pre-lowercased haystack so the JS filter doesn't have to
+    # call ``.toLowerCase()`` on every keystroke.
+    search_bits = [
+        dep.name, dep.version or "",
+        primary.osv_id if primary else "",
+        primary.summary if primary else "",
+    ]
+    if primary and primary.aliases:
+        search_bits.extend(primary.aliases)
+    haystack = " ".join(s for s in search_bits if s).lower()
     parts = [
-        f"<article class=\"finding sev-{f.severity}\">"
+        f"<article class=\"finding sev-{f.severity}\""
+        f" data-severity=\"{f.severity}\""
+        f" data-kev=\"{'1' if f.in_kev else '0'}\""
+        f" data-suppressed=\"{'1' if f.suppressed else '0'}\""
+        f" data-ecosystem=\"{escape(dep.ecosystem)}\""
+        f" data-search=\"{escape(haystack)}\">"
         f"<h3><span class=\"sev sev-{f.severity}\">"
         f"{escape(_SEV_LABEL.get(f.severity, f.severity.title()))}"
         f"</span> {escape(dep.name)} {escape(dep.version or '*')}"
@@ -324,8 +353,17 @@ def _kinded_section(findings, *, header: str, kind_attr: str) -> str:
         kind = getattr(f, kind_attr, "")
         dep = f.dependency
         detail = getattr(f, "detail", "")
+        sup = "1" if getattr(f, "suppressed", False) else "0"
+        haystack = (f"{dep.name} {dep.version or ''} "
+                     f"{kind} {detail}").lower()
         parts.append(
-            f"<li><span class=\"sev sev-{f.severity}\">"
+            f"<li class=\"finding sev-{f.severity}\""
+            f" data-severity=\"{f.severity}\""
+            f" data-kev=\"0\""
+            f" data-suppressed=\"{sup}\""
+            f" data-ecosystem=\"{escape(dep.ecosystem)}\""
+            f" data-search=\"{escape(haystack)}\">"
+            f"<span class=\"sev sev-{f.severity}\">"
             f"{escape(_SEV_LABEL.get(f.severity, f.severity.title()))}"
             f"</span> "
             f"<code>{escape(kind)}</code> "
@@ -341,14 +379,24 @@ def _license_section(findings) -> str:
     for f in findings:
         dep = f.dependency
         spdx = getattr(f, "spdx", None) or "(none)"
+        kind = getattr(f, "kind", "")
         kind_label = {
             "license_denied": "Denied",
             "license_warned": "Warned",
             "license_unknown": "Unknown",
             "license_incompatible": "Incompatible",
-        }.get(getattr(f, "kind", ""), getattr(f, "kind", "?"))
+        }.get(kind, kind or "?")
+        sup = "1" if getattr(f, "suppressed", False) else "0"
+        haystack = (f"{dep.name} {dep.version or ''} "
+                     f"{kind_label} {spdx}").lower()
         parts.append(
-            f"<li><span class=\"sev sev-{f.severity}\">"
+            f"<li class=\"finding sev-{f.severity}\""
+            f" data-severity=\"{f.severity}\""
+            f" data-kev=\"0\""
+            f" data-suppressed=\"{sup}\""
+            f" data-ecosystem=\"{escape(dep.ecosystem)}\""
+            f" data-search=\"{escape(haystack)}\">"
+            f"<span class=\"sev sev-{f.severity}\">"
             f"{escape(_SEV_LABEL.get(f.severity, f.severity.title()))}"
             f"</span> <code>{escape(kind_label)}</code> "
             f"<strong>{escape(dep.ecosystem)}:{escape(dep.name)}</strong> "
@@ -356,6 +404,114 @@ def _license_section(findings) -> str:
         )
     parts.append("</ul></section>")
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Interactive filter bar (vanilla JS, no deps)
+# ---------------------------------------------------------------------------
+
+
+def _filter_bar(ecosystems: Sequence[str]) -> str:
+    """Render the sticky filter bar. ``ecosystems`` populates the
+    dropdown — only ecosystems present in the report appear,
+    keeping the UI tight on single-ecosystem repos.
+
+    The HTML emits a ``role="region"`` + ``aria-label`` so the
+    bar is announced clearly by screen readers."""
+    eco_options = "".join(
+        f'<option value="{escape(e)}">{escape(e)}</option>'
+        for e in ecosystems
+    )
+    return (
+        '<section id="filters" class="filter-bar"'
+        ' role="region" aria-label="Finding filters">'
+        '<label>Min severity '
+        '<select name="severity">'
+        '<option value="">All</option>'
+        '<option value="critical">Critical</option>'
+        '<option value="high">High+</option>'
+        '<option value="medium">Medium+</option>'
+        '<option value="low">Low+</option>'
+        '<option value="info">Info+</option>'
+        '</select></label>'
+        '<label><input type="checkbox" name="kev"> KEV only</label>'
+        '<label><input type="checkbox" name="hidesup" checked>'
+        ' Hide suppressed</label>'
+        '<label>Ecosystem '
+        '<select name="ecosystem">'
+        '<option value="">All</option>'
+        f'{eco_options}'
+        '</select></label>'
+        '<label>Search '
+        '<input type="search" name="q" placeholder="name / CVE / summary">'
+        '</label>'
+        '<span id="filter-counter" class="filter-counter"></span>'
+        '</section>'
+    )
+
+
+# ``data-*`` attributes on each finding card feed the filter
+# logic. The script is intentionally vanilla JS with no
+# dependencies — the report.html artefact must stay a
+# single self-contained file (no CDN fetches, no module
+# imports).
+_FILTER_SCRIPT = """<script>
+(function () {
+  var ranks = {critical: 5, high: 4, medium: 3, low: 2, info: 1};
+  var bar = document.getElementById('filters');
+  if (!bar) return;
+  var counter = document.getElementById('filter-counter');
+  var cards = document.querySelectorAll('article.finding, li.finding');
+
+  function read(name) {
+    var el = bar.querySelector('[name="' + name + '"]');
+    if (!el) return '';
+    if (el.type === 'checkbox') return el.checked;
+    return el.value;
+  }
+
+  function applyFilters() {
+    var sev = read('severity');
+    var kev = read('kev');
+    var hidesup = read('hidesup');
+    var eco = read('ecosystem');
+    var q = (read('q') || '').toLowerCase();
+    var minRank = sev ? ranks[sev] : 0;
+    var visible = 0;
+    cards.forEach(function (c) {
+      var r = ranks[c.dataset.severity] || 0;
+      var show = r >= minRank;
+      if (kev && c.dataset.kev !== '1') show = false;
+      if (hidesup && c.dataset.suppressed === '1') show = false;
+      if (eco && c.dataset.ecosystem !== eco) show = false;
+      if (q && c.dataset.search.indexOf(q) === -1) show = false;
+      c.style.display = show ? '' : 'none';
+      if (show) visible++;
+    });
+    if (counter) {
+      counter.textContent = visible + ' / ' + cards.length + ' visible';
+    }
+    // Hide whole sections whose findings are all filtered out so
+    // the operator doesn't scroll past empty headings.
+    document.querySelectorAll('section').forEach(function (s) {
+      if (s.id === 'filters') return;
+      var children = s.querySelectorAll('article.finding, li.finding');
+      if (children.length === 0) return;  // summary section
+      var anyVisible = false;
+      children.forEach(function (c) {
+        if (c.style.display !== 'none') anyVisible = true;
+      });
+      s.style.display = anyVisible ? '' : 'none';
+    });
+  }
+
+  bar.querySelectorAll('input, select').forEach(function (el) {
+    el.addEventListener('input', applyFilters);
+    el.addEventListener('change', applyFilters);
+  });
+  applyFilters();
+})();
+</script>"""
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +589,37 @@ small.suppressed { color: #888; font-style: italic; }
   dl.counts dt { color: #aaa; }
   ul.kinded li { border-bottom-color: #2a2a2a; }
   .badge.cvss { color: #d4d4d4; border-color: #d4d4d4; }
+  .filter-bar {
+    background: #222; border-color: #444;
+  }
+  .filter-bar input, .filter-bar select {
+    background: #1a1a1a; color: #e5e5e5; border-color: #555;
+  }
+  .filter-counter { color: #aaa; }
 }
+
+/* Sticky filter bar — stays in view as the operator scrolls
+   through long reports so they can refine without scrolling
+   back to the top. */
+.filter-bar {
+  position: sticky; top: 0;
+  background: #fafafa; border: 1px solid #e5e5e5;
+  padding: 0.5rem 0.75rem; border-radius: 4px;
+  margin: 1rem 0;
+  display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem;
+  align-items: center;
+  z-index: 10;
+  font-size: 0.9em;
+}
+.filter-bar label { display: inline-flex; gap: 0.4rem;
+  align-items: center; margin: 0; }
+.filter-bar input[type="search"] { width: 16rem; max-width: 100%; }
+.filter-bar input, .filter-bar select {
+  padding: 0.15rem 0.4rem; border: 1px solid #ccc;
+  border-radius: 3px; font-size: inherit;
+}
+.filter-counter { color: #666; margin-left: auto;
+  font-variant-numeric: tabular-nums; }
 """
 
 

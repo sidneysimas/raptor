@@ -56,13 +56,19 @@ def _hygiene(severity: str = "medium") -> HygieneFinding:
 
 def test_html_is_self_contained_no_external_assets() -> None:
     """No <link rel=stylesheet>, no <script src=...> — single-file
-    output is the whole point of the HTML report shape."""
+    output is the whole point of the HTML report shape. An inline
+    <script> (no src) is allowed — the filter bar uses vanilla
+    inline JS with zero external deps."""
     html = render_html_report(
         target=Path("/repo"), deps_analysed=0,
         vuln_findings=[], hygiene_findings=[],
     )
     assert "<link " not in html.lower()
-    assert "<script" not in html.lower()
+    # Reject any <script that loads from a remote URL or imports
+    # an external module — inline <script> blocks are fine.
+    assert "<script src=" not in html.lower()
+    assert "<script type=\"module\"" not in html.lower()
+    assert "import(" not in html  # ES module dynamic imports
 
 
 def test_html_has_doctype_and_charset() -> None:
@@ -195,3 +201,138 @@ def test_findings_sorted_critical_first() -> None:
         vuln_findings=findings, hygiene_findings=[],
     )
     assert html.index("crit-pkg") < html.index("low-pkg")
+
+
+# ---------------------------------------------------------------------------
+# Interactive filter bar
+# ---------------------------------------------------------------------------
+
+
+def test_filter_bar_rendered_with_all_controls() -> None:
+    """The interactive filter bar provides severity / KEV /
+    suppressed / ecosystem / search controls so operators can
+    triage long reports without grepping the page source."""
+    d = _dep()
+    findings = build_vuln_findings(
+        [d], [OsvResult(d.key(), [_adv("critical", 9.8)])],
+    )
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    assert 'id="filters"' in html
+    assert 'name="severity"' in html
+    assert 'name="kev"' in html
+    assert 'name="hidesup"' in html
+    assert 'name="ecosystem"' in html
+    assert 'name="q"' in html
+
+
+def test_vuln_card_carries_filterable_data_attrs() -> None:
+    """Each finding card exposes data-severity / data-kev /
+    data-suppressed / data-ecosystem / data-search so the JS
+    filter can read them without round-tripping to a model."""
+    d = _dep()
+    findings = build_vuln_findings(
+        [d], [OsvResult(d.key(), [_adv("high", 7.5)])],
+    )
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    assert 'data-severity="high"' in html
+    assert 'data-kev="0"' in html
+    assert 'data-suppressed="0"' in html
+    assert 'data-ecosystem="npm"' in html
+    assert 'data-search="' in html
+
+
+def test_filter_search_haystack_lowercased() -> None:
+    """``data-search`` is pre-lowercased so the JS doesn't have
+    to call ``.toLowerCase()`` on every keystroke. The haystack
+    must contain dep name + version + advisory + summary."""
+    d = _dep(name="MixedCase-Pkg", version="1.2.3")
+    findings = build_vuln_findings(
+        [d], [OsvResult(d.key(), [_adv("high", 7.5)])],
+    )
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    # Lower-cased mixed-case name should appear in the haystack.
+    assert 'data-search="mixedcase-pkg' in html
+
+
+def test_ecosystem_dropdown_only_lists_observed_ecosystems() -> None:
+    """The ecosystem dropdown auto-populates from the findings.
+    On a Python-only project it shouldn't show every ecosystem
+    raptor-sca knows about — just PyPI."""
+    py_dep = Dependency(
+        ecosystem="PyPI", name="django", version="3.2",
+        declared_in=Path("/r/requirements.txt"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=True,
+        purl="pkg:pypi/django@3.2",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+    findings = build_vuln_findings(
+        [py_dep], [OsvResult(py_dep.key(), [_adv("high", 7.5)])],
+    )
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    # Ecosystem dropdown should contain PyPI but NOT npm.
+    eco_select = html[html.index('name="ecosystem"'):
+                        html.index('</select>',
+                                    html.index('name="ecosystem"'))]
+    assert '<option value="PyPI">PyPI</option>' in eco_select
+    assert 'value="npm"' not in eco_select
+
+
+def test_filter_script_inlined_no_external_deps() -> None:
+    """The filter script is embedded in a <script> tag at the
+    end of <body>. Zero ``src=`` references; zero ES module
+    imports."""
+    d = _dep()
+    findings = build_vuln_findings(
+        [d], [OsvResult(d.key(), [_adv("high", 7.5)])],
+    )
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=findings, hygiene_findings=[],
+    )
+    # Script body should be present.
+    assert "<script>" in html
+    assert "applyFilters" in html
+    # Filter logic depends on the rank table; pin its presence.
+    assert "ranks = {critical:" in html or "ranks = {critical: " in html
+
+
+def test_hygiene_row_also_filterable() -> None:
+    """Hygiene/supply-chain rows render as ``<li class="finding">``
+    with the same data attributes so the same filter applies to
+    every section, not just vulns."""
+    findings = [_hygiene("medium")]
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=1,
+        vuln_findings=[], hygiene_findings=findings,
+    )
+    # The hygiene row must carry filterable data-* attrs.
+    assert 'data-severity="medium"' in html
+    # And the section's <li> should carry the ``finding`` class
+    # so the JS query selector picks it up.
+    assert 'class="finding sev-medium"' in html
+
+
+def test_filter_bar_omitted_section_header_handling() -> None:
+    """When the report is empty (no findings) the filter bar is
+    still rendered (it's a no-op) but the JS handles the zero-
+    section case without errors."""
+    html = render_html_report(
+        target=Path("/x"), deps_analysed=0,
+        vuln_findings=[], hygiene_findings=[],
+    )
+    # Filter bar still rendered.
+    assert 'id="filters"' in html
+    # Script still rendered.
+    assert "applyFilters" in html
