@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
 import time
@@ -132,22 +133,38 @@ def run_stress_sweep(
 ) -> List[StressResult]:
     """Walk samples, scan each, return per-sample diagnostics.
 
-    ``out_root`` is a temporary working directory; if None, a
-    ``tempfile.mkdtemp()`` is used. Each scan creates an
-    ``out_root/<project>/`` subdirectory holding ``findings.json``
-    etc; cleaned up after the sweep unless the caller passed an
-    explicit ``out_root``.
+    ``out_root`` defaults to a STABLE per-machine path under
+    ``~/.raptor/cache/sca/stress/clones/``. Stable so that the
+    per-target inventory cache (``core/inventory/builder.default_cache_dir``)
+    finds matching SHA-256 entries across sweep runs and short-
+    circuits the inventory build. The clone subdir for each sample
+    gets ``rm -rf``'d before re-cloning to avoid ``git clone:
+    destination already exists`` — so the source files are fresh
+    every run, but the resolved path stays the same, which is what
+    the inventory cache keys on.
+
+    Tests + one-shot callers that want a fresh tempdir pass an
+    explicit ``out_root``. The tempdir+cleanup path triggers when
+    the caller explicitly passes ``out_root=None`` AND sets the
+    environment variable ``RAPTOR_SCA_STRESS_EPHEMERAL=1`` — the
+    rare "I want zero state across runs" mode for diagnosing
+    cache-pollution bugs.
 
     ``use_existing_clones`` is a no-op today (every scan re-clones).
-    Reserved for a future caching mode.
+    Reserved for a future caching mode that would skip the clone
+    when the existing checkout matches ``sample.git_ref``.
     """
     if samples is None:
         samples = PROJECT_SAMPLES
 
-    cleanup_dir = None
+    cleanup_dir: Optional[Path] = None
     if out_root is None:
-        cleanup_dir = Path(tempfile.mkdtemp(prefix="raptor-sca-stress-"))
-        out_root = cleanup_dir
+        if os.environ.get("RAPTOR_SCA_STRESS_EPHEMERAL"):
+            cleanup_dir = Path(tempfile.mkdtemp(prefix="raptor-sca-stress-"))
+            out_root = cleanup_dir
+        else:
+            from packages.sca import SCA_CACHE_ROOT
+            out_root = SCA_CACHE_ROOT / "stress" / "clones"
     out_root.mkdir(parents=True, exist_ok=True)
 
     results: List[StressResult] = []
@@ -162,7 +179,9 @@ def run_stress_sweep(
     finally:
         if cleanup_dir is not None:
             # Best-effort cleanup. Errors here mustn't mask a real
-            # scan failure.
+            # scan failure. Only the explicitly-ephemeral path runs
+            # this; the default stable-path mode keeps state for the
+            # next sweep.
             try:
                 _rmtree(cleanup_dir)
             except OSError:
@@ -181,6 +200,17 @@ def _scan_one(
     proj_out.mkdir(parents=True, exist_ok=True)
     clone_root = proj_out / "src"
     sca_out = proj_out / "out"
+
+    # Clean residue from prior runs. The ``out_root`` stays stable
+    # across sweeps (so the inventory cache's resolved-abs-path key
+    # finds its checklist), but the clone itself must be fresh —
+    # ``git clone`` refuses to write into an existing directory.
+    # The previous run's ``sca_out`` is also cleaned so a stale
+    # findings.json from a different ref doesn't get mixed in.
+    if clone_root.exists():
+        _rmtree(clone_root)
+    if sca_out.exists():
+        _rmtree(sca_out)
 
     try:
         subprocess.run(
