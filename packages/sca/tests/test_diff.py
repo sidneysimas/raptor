@@ -219,9 +219,255 @@ def test_exit_code_two_for_non_list_top_level(tmp_path: Path) -> None:
 def test_no_changes_renders_explanatory_message(
     tmp_path: Path, capsys,
 ) -> None:
+    """When A and B are identical, the report should explain the
+    state — either "No changes." (truly empty) or a persistent-
+    backlog message that distinguishes "no findings at all" from
+    "same backlog as last week" (the original report ambiguity
+    that motivated the persistent bucket)."""
+    # Truly-empty case: both sides empty.
+    a = _write(tmp_path, "a.json", [])
+    b = _write(tmp_path, "b.json", [])
+    diff.main([str(a), str(b)])
+    out = capsys.readouterr().out
+    assert "No changes." in out
+
+    # Steady-state case: one finding present in both, no churn.
     rows = [_vuln_row()]
+    a2 = _write(tmp_path, "a2.json", rows)
+    b2 = _write(tmp_path, "b2.json", rows)
+    diff.main([str(a2), str(b2)])
+    out = capsys.readouterr().out
+    assert "persistent backlog of 1 unchanged" in out
+    assert "Persistent: **1**" in out
+
+
+# ---------------------------------------------------------------------------
+# Persistent bucket
+# ---------------------------------------------------------------------------
+
+def test_persistent_bucket_carries_unchanged_findings() -> None:
+    """Findings present in both A and B with no suppression-state
+    change populate the ``persistent`` bucket — replaces the
+    pre-fix silent drop. Pre-fix bug: empty new/resolved sections
+    were ambiguous between "no findings at all" and "stable
+    backlog"."""
+    row = _vuln_row(advisory_id="GHSA-stable")
+    d = diff.compute_delta([row], [row])
+    assert len(d.persistent) == 1
+    assert d.persistent[0]["sca"]["advisory"]["id"] == "GHSA-stable"
+    assert d.new == []
+    assert d.resolved == []
+
+
+def test_persistent_excludes_suppression_state_changes() -> None:
+    """A finding whose suppression bit flipped goes to
+    ``suppression_added`` / ``suppression_lifted`` — it is NOT
+    persistent (the operator's relationship to it changed)."""
+    base = _vuln_row(advisory_id="GHSA-flip", suppressed=False)
+    after = _vuln_row(advisory_id="GHSA-flip", suppressed=True,
+                       reason="accepted-risk")
+    d = diff.compute_delta([base], [after])
+    assert len(d.persistent) == 0
+    assert len(d.suppression_added) == 1
+
+
+def test_persistent_excludes_suppressed_on_both_sides_by_default() -> None:
+    """Findings suppressed on both sides are the operator's accepted-
+    risk pile; surfacing them as "persistent" double-counts the
+    backlog. ``include_suppressed=True`` opts them in for the
+    audit case."""
+    row_sup = _vuln_row(advisory_id="GHSA-sup", suppressed=True,
+                         reason="accepted")
+    d_default = diff.compute_delta([row_sup], [row_sup])
+    assert len(d_default.persistent) == 0
+    d_audit = diff.compute_delta([row_sup], [row_sup],
+                                  include_suppressed=True)
+    assert len(d_audit.persistent) == 1
+
+
+def test_persistent_severity_breakdown_in_summary() -> None:
+    """Markdown report's persistent line carries the severity
+    breakdown so operators reading CI logs see whether the backlog
+    is critical-heavy or low-only without opening the full table."""
+    rows = [
+        _vuln_row(advisory_id="A", severity="critical"),
+        _vuln_row(advisory_id="B", severity="critical"),
+        _vuln_row(advisory_id="C", severity="medium"),
+    ]
+    d = diff.compute_delta(rows, rows)
+    md = diff._render_markdown("a.json", "b.json", d)
+    assert "Persistent: **3**" in md
+    assert "2 critical" in md
+    assert "1 medium" in md
+
+
+def test_persistent_full_table_only_with_show_persistent_flag(
+    tmp_path: Path, capsys,
+) -> None:
+    """Default markdown render shows the count + breakdown but
+    NOT the per-row table — defeats the point of ``--baseline``
+    quiet-mode if every steady-state run dumps the full backlog
+    into CI logs."""
+    rows = [_vuln_row(advisory_id="A"),
+            _vuln_row(advisory_id="B")]
     a = _write(tmp_path, "a.json", rows)
     b = _write(tmp_path, "b.json", rows)
     diff.main([str(a), str(b)])
     out = capsys.readouterr().out
-    assert "No changes." in out
+    assert "Persistent: **2**" in out
+    # Without --show-persistent there's no full-table heading.
+    assert "## Persistent backlog" not in out
+
+    diff.main([str(a), str(b), "--show-persistent"])
+    out = capsys.readouterr().out
+    assert "## Persistent backlog" in out
+    # Both rows should appear in the table — the row label is
+    # ``<eco>:<name>@<version> <advisory_id>``.
+    assert "npm:lodash@4.17.4 A" in out
+    assert "npm:lodash@4.17.4 B" in out
+
+
+def test_persistent_in_json_output_with_summary_breakdown(
+    tmp_path: Path, capsys,
+) -> None:
+    """JSON consumers (dashboards / trend lines) need both the
+    full row list AND the summary breakdown counts."""
+    rows = [_vuln_row(advisory_id="A", severity="high"),
+            _vuln_row(advisory_id="B", severity="low")]
+    a = _write(tmp_path, "a.json", rows)
+    b = _write(tmp_path, "b.json", rows)
+    diff.main([str(a), str(b), "--json"])
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert "persistent" in payload
+    assert len(payload["persistent"]) == 2
+    assert payload["summary"]["persistent"] == 2
+    assert payload["summary"]["persistent_by_severity"] == {
+        "high": 1, "low": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PR-comment renderer
+# ---------------------------------------------------------------------------
+
+def test_pr_comment_kev_finding_lifted_to_blocker_verdict() -> None:
+    """A new KEV-listed finding is the most operator-actionable
+    signal we have: surface it as a leading 🛑 verdict so PR
+    reviewers don't have to scroll into the table to see it."""
+    rows_a: List[Dict[str, Any]] = []
+    rows_b = [_vuln_row(advisory_id="GHSA-kev",
+                         severity="high",   # not even critical
+                         in_kev=True)]
+    d = diff.compute_delta(rows_a, rows_b)
+    text = diff.render_pr_comment(d)
+    assert "🛑" in text
+    assert "KEV-listed" in text
+    # And the per-row table is still present for context.
+    assert "GHSA-kev" in text
+
+
+def test_pr_comment_critical_without_kev_still_blocker() -> None:
+    """No KEV but a new critical → 🛑 (blocker tier, distinct from
+    high/medium which are warn/info)."""
+    d = diff.compute_delta(
+        [],
+        [_vuln_row(advisory_id="GHSA-crit", severity="critical")],
+    )
+    text = diff.render_pr_comment(d)
+    assert "🛑" in text
+    assert "critical" in text
+
+
+def test_pr_comment_high_severity_only_renders_warn_verdict() -> None:
+    d = diff.compute_delta(
+        [],
+        [_vuln_row(advisory_id="GHSA-h", severity="high")],
+    )
+    text = diff.render_pr_comment(d)
+    # Warn tier — distinct symbol from blocker.
+    assert "⚠" in text
+    assert "🛑" not in text
+
+
+def test_pr_comment_clean_run_renders_resolved_celebration() -> None:
+    """All findings cleared since baseline: don't bury the win in
+    a table — say it in the verdict line so reviewers see it."""
+    rows_a = [_vuln_row(advisory_id="GHSA-old", severity="high")]
+    d = diff.compute_delta(rows_a, [])
+    text = diff.render_pr_comment(d)
+    assert "✓" in text
+    assert "resolved" in text
+
+
+def test_pr_comment_steady_state_distinguishes_from_truly_clean() -> None:
+    """Same persistent ambiguity the markdown renderer fixed: a
+    PR with no diff should distinguish "no findings at all" from
+    "same backlog as before" so reviewers know what they're
+    looking at."""
+    row = _vuln_row(advisory_id="GHSA-stable", severity="medium")
+    d_steady = diff.compute_delta([row], [row])
+    text_steady = diff.render_pr_comment(d_steady)
+    assert "no change vs baseline" in text_steady
+    assert "1 persistent finding" in text_steady
+
+    d_truly_clean = diff.compute_delta([], [])
+    text_clean = diff.render_pr_comment(d_truly_clean)
+    assert "no findings" in text_clean
+
+
+def test_pr_comment_truncates_large_new_findings_table() -> None:
+    """GitHub comments cap around ~65k chars; on a PR that
+    introduces hundreds of findings (e.g. a major dep upgrade),
+    enumerating every row would push the comment over the cap.
+    Truncate at 20 by default with a drop-off message."""
+    rows_b = [
+        _vuln_row(advisory_id=f"GHSA-{i:03d}", severity="medium")
+        for i in range(35)
+    ]
+    d = diff.compute_delta([], rows_b)
+    text = diff.render_pr_comment(d)
+    assert "Showing top 20 of 35" in text
+    # Default truncation count is reflected in the count cell too.
+    assert "**35**" in text
+
+
+def test_pr_comment_repo_label_overrides_default_header() -> None:
+    """Operators run multiple raptor-sca jobs against the same
+    PR (frontend / backend / docker images). The label keeps the
+    comments distinguishable in the PR thread."""
+    d = diff.compute_delta([], [_vuln_row(advisory_id="GHSA-x")])
+    text = diff.render_pr_comment(
+        d, repo_label="raptor-sca · backend · sha=abc123",
+    )
+    assert "backend" in text
+    assert "abc123" in text
+
+
+def test_pr_comment_persistent_inline_summary_only() -> None:
+    """PR comments must NOT enumerate the persistent backlog (the
+    full table use case lives in baseline-delta.md). Only the
+    severity breakdown line should appear."""
+    persistent_rows = [
+        _vuln_row(advisory_id=f"GHSA-p-{i}", severity="medium")
+        for i in range(50)
+    ]
+    d = diff.compute_delta(persistent_rows, persistent_rows)
+    text = diff.render_pr_comment(d)
+    assert "Persistent backlog: 50" in text
+    # No detailed table for persistent — would explode the comment.
+    assert "GHSA-p-0" not in text
+
+
+def test_pr_comment_via_main_writes_to_stdout(
+    tmp_path: Path, capsys,
+) -> None:
+    rows_b = [_vuln_row(advisory_id="GHSA-flag", severity="critical")]
+    a = _write(tmp_path, "a.json", [])
+    b = _write(tmp_path, "b.json", rows_b)
+    diff.main([str(a), str(b), "--pr-comment",
+                "--repo-label", "myrepo · pr#42"])
+    out = capsys.readouterr().out
+    assert "myrepo · pr#42" in out
+    assert "🛑" in out
+    assert "GHSA-flag" in out

@@ -27,7 +27,7 @@ import argparse
 import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -58,8 +58,13 @@ def main(argv: Sequence[str]) -> int:
 
     if args.json:
         out_text = json.dumps(_delta_to_dict(delta), indent=2)
+    elif args.pr_comment:
+        out_text = render_pr_comment(delta, repo_label=args.repo_label)
     else:
-        out_text = _render_markdown(args.a, args.b, delta)
+        out_text = _render_markdown(
+            args.a, args.b, delta,
+            show_persistent=args.show_persistent,
+        )
 
     if args.out:
         Path(args.out).resolve().write_text(out_text, encoding="utf-8")
@@ -86,6 +91,16 @@ class DeltaResult:
     resolved: List[Dict[str, Any]]
     suppression_added: List[Dict[str, Any]]
     suppression_lifted: List[Dict[str, Any]]
+    # Findings present in both A and B with no suppression-state
+    # change. Used to surface the operator's persistent backlog
+    # — currently silently dropped, which made the delta report
+    # ambiguous (an empty new/resolved section could mean either
+    # "no findings" or "the same backlog as last week"). The
+    # markdown renderer shows the persistent count + severity
+    # breakdown but NOT the full list (defeats the point of
+    # ``--baseline`` quiet-mode). Operators wanting the list pass
+    # ``--show-persistent`` or read the JSON output.
+    persistent: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def compute_delta(
@@ -100,6 +115,15 @@ def compute_delta(
     finding suppressed in B is not the same as a finding *resolved* in
     B; it's a state change reported separately. ``include_suppressed``
     controls whether the new/resolved lists *show* suppressed rows.
+
+    Returns four mutually-exclusive buckets:
+
+      * ``new``       — in B but not in A (newly introduced)
+      * ``resolved``  — in A but not in B (cleared since baseline)
+      * ``suppression_added`` / ``suppression_lifted`` — in both,
+        suppression bit flipped
+      * ``persistent`` — in both, suppression unchanged (the
+        backlog the operator is choosing to live with)
     """
     a_full = _index_by_canonical_key(list(rows_a))
     b_full = _index_by_canonical_key(list(rows_b))
@@ -108,6 +132,7 @@ def compute_delta(
     resolved: List[Dict[str, Any]] = []
     suppression_added: List[Dict[str, Any]] = []
     suppression_lifted: List[Dict[str, Any]] = []
+    persistent: List[Dict[str, Any]] = []
 
     for key, row in b_full.items():
         if key in a_full:
@@ -126,16 +151,25 @@ def compute_delta(
     for key in a_full.keys() & b_full.keys():
         a_sup = bool(a_full[key].get("suppressed"))
         b_sup = bool(b_full[key].get("suppressed"))
-        if a_sup == b_sup:
+        if a_sup != b_sup:
+            target = suppression_added if b_sup else suppression_lifted
+            target.append(b_full[key])
             continue
-        target = suppression_added if b_sup else suppression_lifted
-        target.append(b_full[key])
+        # Same suppression state on both sides → persistent. Skip
+        # suppressed rows from the bucket unless ``include_suppressed``
+        # — the persistent backlog the operator wants to track is the
+        # *visible* one; suppressed-on-both-sides is by definition
+        # the operator's accepted-risk pile and clutters the count.
+        if a_sup and not include_suppressed:
+            continue
+        persistent.append(b_full[key])
 
     return DeltaResult(
         new=_sorted(new),
         resolved=_sorted(resolved),
         suppression_added=_sorted(suppression_added),
         suppression_lifted=_sorted(suppression_lifted),
+        persistent=_sorted(persistent),
     )
 
 
@@ -157,6 +191,24 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--include-suppressed", action="store_true",
                    help="treat suppressed findings as visible (default: skip "
                         "them from new/resolved)")
+    p.add_argument("--show-persistent", action="store_true",
+                   help="render the full table of persistent findings "
+                        "(present in both baselines, unchanged "
+                        "suppression state). Off by default — the "
+                        "summary line shows the count + severity "
+                        "breakdown so CI logs stay quiet for steady-"
+                        "state weeks. Pass this flag for an explicit "
+                        "audit of the team's accepted backlog.")
+    p.add_argument("--pr-comment", action="store_true",
+                   help="render as a GitHub-flavoured PR comment "
+                        "(compact verdict + collapsed details). "
+                        "Suitable for piping to ``gh pr comment "
+                        "--body-file`` from CI.")
+    p.add_argument("--repo-label", default=None,
+                   help="when ``--pr-comment`` is set, override the "
+                        "header label (default: 'raptor-sca'). Lets "
+                        "operators add commit SHAs / repo names "
+                        "for at-a-glance attribution in PR threads.")
     p.add_argument("--fail-on-severity", default="high",
                    choices=("info", "low", "medium", "high", "critical"),
                    help="severity threshold for the exit-code check "
@@ -253,24 +305,55 @@ def _delta_to_dict(d: DeltaResult) -> Dict[str, Any]:
         "resolved": d.resolved,
         "suppression_added": d.suppression_added,
         "suppression_lifted": d.suppression_lifted,
+        "persistent": d.persistent,
         "summary": {
             "new": len(d.new),
             "resolved": len(d.resolved),
             "suppression_added": len(d.suppression_added),
             "suppression_lifted": len(d.suppression_lifted),
+            "persistent": len(d.persistent),
+            "persistent_by_severity": _severity_breakdown(d.persistent),
         },
     }
+
+
+def _severity_breakdown(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Counts by severity. Lets the JSON consumer drive a stacked
+    bar chart over time without re-walking the full row list."""
+    counts: Dict[str, int] = {}
+    for r in rows:
+        sev = (r.get("severity") or "info").lower()
+        counts[sev] = counts.get(sev, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
 # Markdown rendering
 # ---------------------------------------------------------------------------
 
-def _render_markdown(a_path: str, b_path: str, d: DeltaResult) -> str:
+def _render_markdown(
+    a_path: str, b_path: str, d: DeltaResult, *,
+    show_persistent: bool = False,
+) -> str:
     buf = StringIO()
     buf.write(f"# raptor-sca diff — `{a_path}` → `{b_path}`\n\n")
     buf.write(f"- New: **{len(d.new)}**\n")
     buf.write(f"- Resolved: **{len(d.resolved)}**\n")
+    if d.persistent:
+        # Persistent backlog as a single line with the breakdown
+        # — the count alone hides whether the team's living with
+        # 5 mediums or 5 criticals. Without this line, an empty
+        # new/resolved diff is ambiguous: "no findings at all" vs
+        # "same backlog as last week" look identical in CI logs.
+        sev_break = _severity_breakdown(d.persistent)
+        sev_str = ", ".join(
+            f"{n} {sev}" for sev in
+            ("critical", "high", "medium", "low", "info")
+            if (n := sev_break.get(sev, 0)) > 0
+        ) or "—"
+        buf.write(
+            f"- Persistent: **{len(d.persistent)}** ({sev_str})\n"
+        )
     if d.suppression_added or d.suppression_lifted:
         buf.write(f"- Suppression added: **{len(d.suppression_added)}**\n")
         buf.write(f"- Suppression lifted: **{len(d.suppression_lifted)}**\n")
@@ -288,11 +371,155 @@ def _render_markdown(a_path: str, b_path: str, d: DeltaResult) -> str:
     if d.suppression_lifted:
         buf.write("## Suppression lifted\n\n")
         _table(buf, d.suppression_lifted, show_suppression=True)
+    if show_persistent and d.persistent:
+        # Full enumeration is opt-in; the default keeps CI logs
+        # quiet for steady-state weeks.
+        buf.write("## Persistent backlog\n\n")
+        _table(buf, d.persistent)
 
     if not (d.new or d.resolved or d.suppression_added
             or d.suppression_lifted):
-        buf.write("No changes.\n")
+        if d.persistent:
+            buf.write(f"No new or resolved findings; persistent "
+                       f"backlog of {len(d.persistent)} unchanged.\n")
+        else:
+            buf.write("No changes.\n")
 
+    return buf.getvalue()
+
+
+def render_pr_comment(
+    delta: DeltaResult, *,
+    repo_label: Optional[str] = None,
+    truncate_table_at: int = 20,
+) -> str:
+    """Render a delta as a GitHub-flavoured PR comment.
+
+    Differences from ``_render_markdown``:
+      * Compact verdict header — operators reading dozens of PR
+        comments need to know in one line whether to look further
+      * KEV / critical findings get a leading 🛑 badge (operator
+        eye-magnet for "this PR introduces something dangerous")
+      * Persistent backlog rendered as count-only (full table
+        defeats the comment use case at >20 rows; GitHub
+        truncates comments past ~65k)
+      * Resolved findings collapsed into a single line —
+        celebrating fixes is fine but per-row enumeration eats
+        comment real estate
+      * Generated-by footer + suppression hint so reviewers know
+        what they're looking at without checking the workflow
+        config
+
+    The output is plain GitHub-flavoured Markdown; the caller is
+    expected to pipe into ``gh pr comment --body-file`` or post via
+    the GitHub REST API. Emoji here are deliberate (operator eye-
+    magnets for verdict/blocker badges) — distinct from CLAUDE.md's
+    "no emoji" rule which targets *Claude's* prose, not generated
+    artefacts.
+    """
+    buf = StringIO()
+    label = repo_label or "raptor-sca"
+    new_count = len(delta.new)
+    resolved_count = len(delta.resolved)
+    kev_new = sum(1 for r in delta.new
+                   if (r.get("sca") or {}).get("in_kev"))
+    crit_new = sum(1 for r in delta.new
+                    if (r.get("severity") or "").lower() == "critical")
+    high_new = sum(1 for r in delta.new
+                    if (r.get("severity") or "").lower() == "high")
+
+    # Verdict line. Order: blocker (KEV / critical) > warn (high) >
+    # neutral (only mediums/lows) > clean (no new) > clean+resolved.
+    if kev_new:
+        verdict = (f"**🛑 {kev_new} new KEV-listed finding"
+                    f"{'s' if kev_new != 1 else ''}** — "
+                    "exploited in the wild, fix before merging")
+    elif crit_new:
+        verdict = (f"**🛑 {crit_new} new critical finding"
+                    f"{'s' if crit_new != 1 else ''}**")
+    elif high_new:
+        verdict = (f"**⚠ {high_new} new high-severity finding"
+                    f"{'s' if high_new != 1 else ''}**")
+    elif new_count:
+        verdict = (f"{new_count} new finding"
+                    f"{'s' if new_count != 1 else ''} "
+                    "(none critical/high)")
+    elif resolved_count:
+        verdict = f"✓ {resolved_count} finding(s) resolved, no new issues"
+    elif delta.persistent:
+        verdict = (f"✓ no change vs baseline · "
+                    f"{len(delta.persistent)} persistent finding"
+                    f"{'s' if len(delta.persistent) != 1 else ''}")
+    else:
+        verdict = "✓ no findings"
+
+    buf.write(f"### {label} — {verdict}\n\n")
+
+    # One-line summary table for at-a-glance triage.
+    buf.write("| New | Resolved | Persistent | Suppression Δ |\n")
+    buf.write("|---|---|---|---|\n")
+    sup_delta = (len(delta.suppression_added)
+                  + len(delta.suppression_lifted))
+    sup_cell = (f"+{len(delta.suppression_added)} / "
+                 f"−{len(delta.suppression_lifted)}"
+                 if sup_delta else "—")
+    buf.write(
+        f"| **{new_count}** | {resolved_count} "
+        f"| {len(delta.persistent)} | {sup_cell} |\n\n"
+    )
+
+    if delta.new:
+        # Truncate the new-findings table at ``truncate_table_at`` to
+        # stay inside GitHub's comment cap on busy PRs. The drop-off
+        # message tells reviewers where the rest live.
+        buf.write("<details open>\n")
+        buf.write(f"<summary><b>New findings ({new_count})</b></summary>\n\n")
+        rows_to_show = delta.new[:truncate_table_at]
+        _table(buf, rows_to_show)
+        if new_count > truncate_table_at:
+            buf.write(
+                f"\n_Showing top {truncate_table_at} of {new_count} "
+                "by severity. Full list in `findings.json`._\n"
+            )
+        buf.write("</details>\n\n")
+
+    if delta.resolved:
+        buf.write("<details>\n")
+        buf.write(
+            f"<summary>Resolved ({resolved_count})</summary>\n\n"
+        )
+        # Resolved is celebratory — don't truncate aggressively; do
+        # collapse into one row per advisory rather than per source.
+        _table(buf, delta.resolved[:truncate_table_at])
+        if resolved_count > truncate_table_at:
+            buf.write(
+                f"\n_+{resolved_count - truncate_table_at} more._\n"
+            )
+        buf.write("</details>\n\n")
+
+    if delta.persistent:
+        sev_break = _severity_breakdown(delta.persistent)
+        sev_str = ", ".join(
+            f"{n} {sev}" for sev in
+            ("critical", "high", "medium", "low", "info")
+            if (n := sev_break.get(sev, 0)) > 0
+        ) or "—"
+        buf.write(
+            f"_Persistent backlog: {len(delta.persistent)} "
+            f"({sev_str})_  \n"
+        )
+
+    if delta.suppression_added or delta.suppression_lifted:
+        buf.write(
+            f"_Suppression: +{len(delta.suppression_added)} added · "
+            f"−{len(delta.suppression_lifted)} lifted_  \n"
+        )
+
+    buf.write(
+        "\n<sub>Generated by [raptor-sca]"
+        "(https://github.com/grok-org/raptor) · "
+        "suppress with `.raptor-sca-suppress.yml`</sub>\n"
+    )
     return buf.getvalue()
 
 
