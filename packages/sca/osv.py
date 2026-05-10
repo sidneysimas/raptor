@@ -191,6 +191,9 @@ class OsvClient:
                          if d.ecosystem in _OSV_QUERYABLE]
             non_queryable = [d for d in uncached
                              if d.ecosystem not in _OSV_QUERYABLE]
+            # Build all chunk-payloads up front so the parallel
+            # dispatch below has a flat list to map over.
+            chunk_payloads: List[Tuple[List["Dependency"], List[Dict]]] = []
             for chunk in _chunked(queryable, _BATCH_CHUNK_SIZE):
                 queries = [
                     {
@@ -202,7 +205,49 @@ class OsvClient:
                     }
                     for d in chunk
                 ]
+                chunk_payloads.append((list(chunk), queries))
+
+            # Parallel /querybatch dispatch. Each batch hits OSV with
+            # ~500 deps; sequential traversal of N chunks costs the
+            # sum of per-batch RTTs, which dominates large scans
+            # (strapi-3: 3326 deps = 7 chunks × ~1s each = 7s pre-fix).
+            # OSV publishes a soft rate limit but doesn't enforce
+            # bursts of small numbers; capping workers at 4 keeps us
+            # well below any per-IP threshold while parallelising the
+            # critical-path RTT. The per-host circuit breaker
+            # (core/http/urllib_backend) catches any genuine 429
+            # storm and fails subsequent calls fast.
+            #
+            # ``self._inner.query_batch`` failures are absorbed
+            # already by the inner client (returns ``[[]]`` per
+            # query on HTTP error), so we don't need a try/except
+            # in the worker — propagated exceptions are programmer
+            # errors, not transient.
+            def _query_one_chunk(
+                payload: Tuple[List["Dependency"], List[Dict]],
+            ) -> Tuple[List["Dependency"], List[List[str]]]:
+                chunk, queries = payload
                 results = self._inner.query_batch(queries)
+                return chunk, results
+
+            if len(chunk_payloads) >= 2:
+                from concurrent.futures import ThreadPoolExecutor
+                max_workers = min(4, len(chunk_payloads))
+                with ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="sca-osv-batch",
+                ) as pool:
+                    chunk_results = list(pool.map(
+                        _query_one_chunk, chunk_payloads,
+                    ))
+            else:
+                # 0 or 1 chunks — no parallelism benefit; avoid the
+                # ThreadPoolExecutor overhead.
+                chunk_results = [
+                    _query_one_chunk(p) for p in chunk_payloads
+                ]
+
+            for chunk, results in chunk_results:
                 for dep, ids in zip(chunk, results):
                     self._cache.put(
                         self._query_key(dep), ids,
