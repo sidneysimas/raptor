@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 SUBCOMMANDS = ("fix", "check", "upgrade", "diff",
                "verify", "health", "purl", "render",
-               "clean-cache", "dt-push")
+               "clean-cache", "dt-push", "suppress")
 _SUBCOMMANDS = SUBCOMMANDS  # backcompat alias for internal callers
 
 
@@ -108,6 +108,9 @@ def _dispatch(subcommand: str, argv: List[str]) -> int:
     if subcommand == "dt-push":
         from . import dependency_track
         return dependency_track.main(argv)
+    if subcommand == "suppress":
+        from . import suppress_cli
+        return suppress_cli.main(argv)
     print(f"raptor-sca: unknown subcommand {subcommand!r}", file=sys.stderr)
     return 2
 
