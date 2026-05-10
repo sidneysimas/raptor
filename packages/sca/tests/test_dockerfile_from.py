@@ -295,6 +295,35 @@ def test_fetch_returns_none_on_manifest_error():
     assert sbom is None
 
 
+def test_find_dockerfiles_excludes_test_ci_parents(tmp_path: Path):
+    """Dockerfiles under test/ ci/ tests/ fixtures/ examples/ etc.
+    parents are skipped — they're integration-test setup or CI
+    infrastructure, not the project's runtime image. Caught the
+    spring-boot-2.1 ``ci/images/...-ci-image/Dockerfile`` family
+    that referenced long-purged JDK early-access tags."""
+    from packages.sca.dockerfile_from import find_dockerfiles
+    # Production Dockerfile (kept)
+    (tmp_path / "Dockerfile").write_text("FROM alpine:3.18\n")
+    # Test-fixture Dockerfile (skipped)
+    fix_dir = tmp_path / "tests" / "integration"
+    fix_dir.mkdir(parents=True)
+    (fix_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
+    # CI infrastructure Dockerfile (skipped)
+    ci_dir = tmp_path / "ci" / "images" / "build-image"
+    ci_dir.mkdir(parents=True)
+    (ci_dir / "Dockerfile").write_text("FROM openjdk:8u181-jdk\n")
+    # Examples (skipped)
+    ex_dir = tmp_path / "examples" / "tutorial"
+    ex_dir.mkdir(parents=True)
+    (ex_dir / "Dockerfile").write_text("FROM python:3.6-slim\n")
+
+    found = find_dockerfiles(tmp_path)
+    found_names = {p.parent.name + "/" + p.name for p in found}
+    assert found_names == {tmp_path.name + "/Dockerfile"}, (
+        f"expected only the root Dockerfile, got: {found_names}"
+    )
+
+
 def test_fetch_negative_caches_failed_lookups(tmp_path: Path):
     """Once a manifest fetch fails, subsequent fetches for the same
     image ref must short-circuit on the disk cache rather than

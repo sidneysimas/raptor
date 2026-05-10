@@ -112,11 +112,51 @@ def _is_dockerfile(path: Path) -> bool:
     return False
 
 
+# Directory names that almost certainly carry test fixtures or CI
+# infrastructure rather than production-deployable container images.
+# Excluded from image discovery (NOT from manifest discovery, which
+# happens via discovery.find_manifests with a different set —
+# tests/composer.json IS a real dep declaration we want to scan).
+#
+# Concrete cases caught:
+# - spring-boot's ``ci/images/spring-boot-jdk*-ci-image/Dockerfile``
+#   (JDK early-access tags long since purged from Docker Hub —
+#   triggered the spring-boot-2.1 stress-sweep outlier)
+# - pterodactyl / istio / strapi test fixtures referencing
+#   sample images from old tutorials
+# - any project's ``test/Dockerfile`` for integration-test setup
+_IMAGE_DISCOVERY_EXCLUDE_PARENT_DIRS = frozenset({
+    "test", "tests", "testing",
+    "ci",            # CI infrastructure dockerfiles, not the app
+    "fixtures", "fixture",
+    "examples", "example", "sample", "samples",
+})
+
+
+def _path_under_excluded_image_parent(p: Path, target: Path) -> bool:
+    """True when any directory between ``target`` and ``p`` matches
+    a name in ``_IMAGE_DISCOVERY_EXCLUDE_PARENT_DIRS`` (lowercased
+    comparison)."""
+    try:
+        rel = p.resolve().relative_to(target.resolve())
+    except ValueError:
+        return False
+    for part in rel.parts[:-1]:  # exclude file basename
+        if part.lower() in _IMAGE_DISCOVERY_EXCLUDE_PARENT_DIRS:
+            return True
+    return False
+
+
 def find_dockerfiles(target: Path) -> List[Path]:
     """Walk the target and return Dockerfiles to scan.
 
     Skips conventional excluded directories (vendor, node_modules,
     .git, etc.) — same set the manifest discovery walker uses.
+    Additionally skips Dockerfiles under test/ci/fixture/example
+    parent directories: those are integration-test setup or CI
+    infrastructure, not the project's runtime base image, and
+    routinely reference long-purged tags that burn manifest-fetch
+    budget without producing actionable findings.
     """
     from .discovery import EXCLUDED_DIR_NAMES
 
@@ -128,8 +168,11 @@ def find_dockerfiles(target: Path) -> List[Path]:
         ]
         for f in files:
             p = Path(root) / f
-            if _is_dockerfile(p):
-                out.append(p)
+            if not _is_dockerfile(p):
+                continue
+            if _path_under_excluded_image_parent(p, target):
+                continue
+            out.append(p)
     out.sort()
     return out
 
@@ -688,6 +731,8 @@ def find_compose_image_refs(target: Path) -> List[ImageRefSource]:
             p = Path(root) / f
             if not _is_compose_file(p):
                 continue
+            if _path_under_excluded_image_parent(p, target):
+                continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
                 data = safe_load(text)
@@ -802,6 +847,8 @@ def find_kubernetes_image_refs(target: Path) -> List[ImageRefSource]:
         for f in files:
             p = Path(root) / f
             if not _is_k8s_manifest(p):
+                continue
+            if _path_under_excluded_image_parent(p, target):
                 continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
