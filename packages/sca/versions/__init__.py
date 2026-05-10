@@ -25,11 +25,33 @@ class VersionError(ValueError):
 
 def compare(ecosystem: str, a: str, b: str) -> int:
     """Return -1, 0, or 1 for a < b, a == b, a > b within the ecosystem's
-    version semantics."""
+    version semantics.
+
+    Raises :class:`VersionError` when either ``a`` or ``b`` is
+    unparseable for the ecosystem. The per-ecosystem comparators
+    historically raised plain ``ValueError`` for unparseable input
+    — the dispatcher normalises so callers' ``except VersionError``
+    blocks fire (an ``except VersionError`` handler does NOT catch
+    its parent ``ValueError``, so the un-normalised path leaked
+    failures past intended handlers).
+
+    The bug-class this catches: real-world OSV data sometimes
+    carries cross-ecosystem ``fixed_versions`` (e.g. an npm
+    advisory with a Ruby-shaped ``'7.0.8.3'`` fix entry). Without
+    the normalisation, a single unparseable fix-version aborts
+    the whole scan via ``findings._smallest_applicable_fix``;
+    with it, the unparseable entry is skipped and the scan
+    continues with the parseable ones.
+    """
     cmp = _comparators.get(_canonical_ecosystem(ecosystem))
     if cmp is None:
         raise VersionError(f"no version comparator for ecosystem: {ecosystem}")
-    return cmp(a, b)
+    try:
+        return cmp(a, b)
+    except VersionError:
+        raise
+    except ValueError as exc:
+        raise VersionError(str(exc)) from exc
 
 
 def in_range(ecosystem: str, version: str, events: List[Dict[str, str]]) -> bool:

@@ -118,3 +118,39 @@ def test_compare_dispatcher_picks_right_comparator() -> None:
     assert compare("RubyGems", "1.0.0.pre1", "1.0.0") == -1
     assert compare("NuGet", "1.0.0-rc1", "1.0.0") == -1
     assert compare("Packagist", "1.0.0-alpha", "1.0.0") == -1
+
+
+def test_compare_dispatcher_normalises_value_error_to_version_error():
+    """Per-ecosystem comparators historically raise plain
+    ``ValueError`` for unparseable versions. The dispatcher must
+    normalise to ``VersionError`` so callers'
+    ``except VersionError`` blocks fire — ``except VersionError``
+    does NOT catch its parent ``ValueError``.
+
+    Regression: stress sweep on rails @ v7.1.2 hit an OSV
+    advisory with cross-ecosystem ``fixed_versions``: an
+    npm-tagged dep had a Ruby-shaped ``'7.0.8.3'`` fix entry.
+    Pre-fix the plain ``ValueError`` from
+    ``semver.parse('7.0.8.3')`` leaked past
+    ``findings._smallest_applicable_fix``'s
+    ``except VersionError`` handler, aborting the whole scan.
+    """
+    from packages.sca.versions import VersionError
+    # ``'7.0.8.3'`` against ``npm`` — semver can't parse it, must
+    # surface as VersionError (not plain ValueError).
+    with pytest.raises(VersionError) as exc_info:
+        compare("npm", "7.0.8.3", "2.0.5")
+    # And the underlying ValueError chained for diagnostics.
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_compare_dispatcher_passes_through_version_error_unchanged():
+    """When the dispatcher itself raises VersionError (e.g.
+    unknown ecosystem), pass it through without adapter-wrapping
+    so the cause-chain stays clean."""
+    from packages.sca.versions import VersionError
+    with pytest.raises(VersionError) as exc_info:
+        compare("not-an-ecosystem", "1.0.0", "2.0.0")
+    # No cause — this VersionError was raised directly.
+    assert exc_info.value.__cause__ is None
