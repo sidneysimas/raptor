@@ -657,6 +657,66 @@ def test_gha_sha_pinned_same_major_pin_skipped(tmp_path: Path) -> None:
     assert [c for c in report.candidates if c.kind == "gha_uses"] == []
 
 
+def test_gha_releases_latest_non_semver_falls_back_to_tags(
+    tmp_path: Path,
+) -> None:
+    """``github/codeql-action``-shaped case: ``releases/latest``
+    returns ``codeql-bundle-v2.25.4`` (a stable release but
+    non-semver tag shape). The bumper can't substitute that for
+    a ``v4`` pin; it should fall through to ``/tags`` and pick
+    the highest stable-semver tag from there.
+
+    Pre-fix the bumper proposed
+    ``v4 → codeql-bundle-v2.25.4`` which would have produced an
+    invalid pin. Live-output regression from raptor's actual
+    workflow scan."""
+    _workflow(tmp_path, "ci.yml",
+              "      - uses: github/codeql-action/init@v4\n")
+    http = _StubHttp({
+        # /releases/latest returns the non-semver bundle tag.
+        "https://api.github.com/repos/github/codeql-action/releases/latest":
+            {"tag_name": "codeql-bundle-v2.25.4"},
+        # /tags has both bundle tags (skipped) AND stable-semver tags.
+        "https://api.github.com/repos/github/codeql-action/tags?per_page=100":
+            [
+                {"name": "codeql-bundle-v2.25.4"},   # non-semver — skip
+                {"name": "v5"},                       # stable — winner
+                {"name": "v4.30.6"},
+                {"name": "v4"},
+            ],
+    })
+    report = run_bump(tmp_path, http=http)
+    gha_cands = [c for c in report.candidates if c.kind == "gha_uses"]
+    assert len(gha_cands) == 1
+    # MUST be the stable-semver candidate, NOT codeql-bundle.
+    assert gha_cands[0].target_version == "v5"
+    assert "codeql-bundle" not in gha_cands[0].target_version
+
+
+def test_gha_releases_latest_and_tags_both_non_semver_skipped(
+    tmp_path: Path,
+) -> None:
+    """When NEITHER /releases/latest NOR /tags produces a
+    stable-semver tag, the repo lands in ``skipped`` with a
+    clear reason. Operator sees the gap rather than the bumper
+    proposing a non-semver pin."""
+    _workflow(tmp_path, "ci.yml",
+              "      - uses: weird/project@v4\n")
+    http = _StubHttp({
+        "https://api.github.com/repos/weird/project/releases/latest":
+            {"tag_name": "release-2026-q1"},
+        "https://api.github.com/repos/weird/project/tags?per_page=100":
+            [{"name": "release-2026-q1"}, {"name": "rc-build-7"}],
+    })
+    report = run_bump(tmp_path, http=http)
+    assert [c for c in report.candidates if c.kind == "gha_uses"] == []
+    # Should be in skipped with explanatory reason.
+    skipped_reasons = [s[2] for s in report.skipped
+                        if s[0] == "weird/project"]
+    assert len(skipped_reasons) == 1
+    assert "non-semver" in skipped_reasons[0]
+
+
 def test_gha_upstream_404_falls_back_to_tags(tmp_path: Path) -> None:
     """Some actions don't cut releases. Walker falls back to
     /tags (we already shipped ``latest_tag`` in Phase 2.a)."""
@@ -672,6 +732,84 @@ def test_gha_upstream_404_falls_back_to_tags(tmp_path: Path) -> None:
     assert len(gha_cands) == 1
     assert gha_cands[0].current_version == "v2.0"
     assert gha_cands[0].target_version == "v2.1"
+
+
+# ---------------------------------------------------------------------------
+# Render-side deduplication (Followup B)
+# ---------------------------------------------------------------------------
+
+def test_render_dedups_identical_candidates_across_files(
+    tmp_path: Path,
+) -> None:
+    """When 3 workflow files all pin actions/checkout@v4, the
+    rendered report shows ONE row with ``(3 files)`` — not three
+    identical rows. The underlying ``results`` list still has
+    three entries so --apply touches all three files.
+
+    Pre-fix raptor's bump output showed 8 CODEQL_VERSION rows
+    and 3 github/codeql-action rows; operators read it as
+    duplicate noise."""
+    for name in ("a.yml", "b.yml", "c.yml"):
+        _workflow(tmp_path, name,
+                  "      - uses: actions/checkout@v4\n")
+    http = _StubHttp({
+        "https://api.github.com/repos/actions/checkout/releases/latest":
+            {"tag_name": "v5"},
+    })
+    report = run_bump(tmp_path, http=http)
+    # Underlying results: 3 (one per file).
+    gha_results = [r for r in report.results
+                    if r.candidate.kind == "gha_uses"]
+    assert len(gha_results) == 3
+    # Rendered: one row with "(3 files)" annotation.
+    text = render_report(report)
+    # Filter to candidate ROWS (kind=gha_uses appears in the
+    # candidate rows but also in the header — exclude header
+    # by looking for the locator field directly).
+    rows = [l for l in text.splitlines() if "actions/checkout" in l]
+    assert len(rows) == 1, (
+        f"expected 1 deduped row; got {len(rows)}: {rows}"
+    )
+    # The result column carries the file count.
+    assert "(3 files)" in rows[0]
+
+
+def test_render_applied_count_in_dedup_row(tmp_path: Path) -> None:
+    """When --apply runs, the dedup row shows ``applied (N
+    files)`` rather than just ``applied``."""
+    for name in ("a.yml", "b.yml"):
+        _workflow(tmp_path, name,
+                  "      - uses: actions/checkout@v4\n")
+    http = _StubHttp({
+        "https://api.github.com/repos/actions/checkout/releases/latest":
+            {"tag_name": "v5"},
+    })
+    report = run_bump(tmp_path, http=http, apply=True)
+    text = render_report(report)
+    # All files applied → "applied (2 files)" suffix.
+    assert "applied (2 files)" in text
+
+
+def test_render_single_file_still_shows_filename_count(
+    tmp_path: Path,
+) -> None:
+    """A non-duplicated row still renders cleanly without the
+    file-count noise — single-file candidates were already fine
+    pre-fix; preserve that."""
+    _workflow(tmp_path, "ci.yml",
+              "      - uses: actions/checkout@v4\n")
+    http = _StubHttp({
+        "https://api.github.com/repos/actions/checkout/releases/latest":
+            {"tag_name": "v5"},
+    })
+    report = run_bump(tmp_path, http=http)
+    text = render_report(report)
+    # Single-file candidate: no "(N files)" suffix (renders empty
+    # Result column).
+    rows = [l for l in text.splitlines() if "actions/checkout" in l]
+    assert len(rows) == 1
+    assert "(1 file)" not in rows[0]
+    assert "(2 files)" not in rows[0]
 
 
 def test_upstream_lookup_dedups_across_dockerfiles(tmp_path: Path) -> None:

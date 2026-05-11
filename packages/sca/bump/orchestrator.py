@@ -638,7 +638,21 @@ def _lookup_latest_release_or_tag(
     """Look up the latest stable upstream version for a GitHub
     repo. Tries ``/releases/latest`` first (proper GitHub
     Releases); falls back to ``/tags`` (projects that tag without
-    releases). Caches per-repo via ``uses_cache``."""
+    releases). Caches per-repo via ``uses_cache``.
+
+    Stability filter: GitHub's ``releases/latest`` endpoint
+    returns whatever tag the publisher marked as the latest
+    release, without enforcing stable-semver shape. For example,
+    ``github/codeql-action`` publishes ``codeql-bundle-vX.Y.Z``
+    bundle releases that don't match the ``v?N.N.N`` shape we
+    expect for auto-bumping a ``v4`` → ``vN`` pin. This function
+    validates the upstream-latest result through ``parse_stable``
+    and falls through to the tag-listing path if the
+    ``releases/latest`` tag doesn't pass the filter. If neither
+    path produces a stable-semver tag, the repo is recorded as
+    skipped with reason — operator sees the gap explicitly.
+    """
+    from core.upstream_latest._version_filter import parse_stable
     from core.upstream_latest.github_releases import (
         NoStableVersionsFound, UpstreamLookupError,
         latest_release, latest_tag,
@@ -648,16 +662,30 @@ def _lookup_latest_release_or_tag(
         return uses_cache[cache_key]
     target_ref = None
     try:
-        target_ref = latest_release(
+        candidate = latest_release(
             repo, http=http, cache=cache, github_token=github_token,
         )
     except UpstreamLookupError:
+        candidate = None
+    # Validate the /releases/latest result. Some projects publish
+    # non-semver bundle tags (codeql-bundle-vX.Y.Z); we can't
+    # substitute those for a vN pin shape, so fall through to
+    # /tags which DOES filter to stable.
+    if candidate is not None and parse_stable(candidate) is not None:
+        target_ref = candidate
+    else:
         try:
             target_ref = latest_tag(
                 repo, http=http, cache=cache, github_token=github_token,
             )
         except (UpstreamLookupError, NoStableVersionsFound) as e:
-            skipped.append((repo, workflow, f"upstream lookup failed: {e}"))
+            skipped.append((
+                repo, workflow,
+                (f"upstream lookup found non-semver release "
+                 f"{candidate!r} and tag-listing also failed: {e}")
+                if candidate is not None
+                else f"upstream lookup failed: {e}",
+            ))
             uses_cache[cache_key] = None
             return None
     uses_cache[cache_key] = target_ref
@@ -732,27 +760,65 @@ def render_report(report: BumpReport) -> str:
         lines.append("")
         lines.append(
             f"  {'Kind':<11} {'Locator':<35} "
-            f"{'Current':<14} {'Target':<14} {'Verdict':<8} Result"
+            f"{'Current':<14} {'Target':<22} {'Verdict':<8} Result"
         )
+        # Dedup the display by (kind, locator, current_version,
+        # target_version). The underlying ``results`` list still
+        # has one entry per file (so --apply iterates all files)
+        # but the human-readable table folds identical proposals
+        # into one row with a file-count suffix. Pre-fix on
+        # raptor: 8 CODEQL_VERSION rows + 3 github/codeql-action
+        # rows (one per file each); operators read it as noise.
+        groups: "dict[tuple, List[BumpResult]]" = {}
+        order: List[tuple] = []
         for r in report.results:
-            applied = ""
-            if r.rewrite_result is not None:
-                applied = (
-                    "applied" if r.rewrite_result.applied
-                    else f"skipped ({r.rewrite_result.reason})"
-                )
-            elif r.error:
-                applied = f"error: {r.error}"
+            key = (
+                r.candidate.kind, r.candidate.locator,
+                r.candidate.current_version, r.candidate.target_version,
+            )
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+        for key in order:
+            group = groups[key]
+            head = group[0]
+            n_files = len(group)
+            # ``Result`` field aggregates the per-file outcomes:
+            # if all applied → "applied (N files)"; if mixed →
+            # "applied N, skipped M"; if none applied → just
+            # the dominant reason from the first.
+            applied_count = sum(
+                1 for r in group
+                if r.rewrite_result is not None and r.rewrite_result.applied
+            )
+            if applied_count > 0:
+                if applied_count == n_files:
+                    result_label = (
+                        f"applied ({n_files} file)"
+                        if n_files == 1 else f"applied ({n_files} files)"
+                    )
+                else:
+                    result_label = (
+                        f"applied {applied_count}/{n_files}"
+                    )
+            elif head.rewrite_result is not None:
+                result_label = f"skipped ({head.rewrite_result.reason})"
+            elif head.error:
+                result_label = f"error: {head.error}"
+            else:
+                result_label = "" if n_files == 1 else f"({n_files} files)"
             lines.append(
-                f"  {r.candidate.kind:<11} "
-                f"{r.candidate.locator:<35} "
-                f"{r.candidate.current_version:<14} "
-                f"{r.candidate.target_version:<14} "
-                f"{r.verdict_label:<8} {applied}"
+                f"  {head.candidate.kind:<11} "
+                f"{head.candidate.locator:<35} "
+                f"{head.candidate.current_version:<14} "
+                f"{head.candidate.target_version:<22} "
+                f"{head.verdict_label:<8} {result_label}"
             )
             # Surface the supply-chain findings inline so operators
-            # know WHY a verdict isn't Clean.
-            for sf in r.bump_supply_chain_findings:
+            # know WHY a verdict isn't Clean. (One copy per group;
+            # identical proposals would emit identical findings.)
+            for sf in head.bump_supply_chain_findings:
                 lines.append(f"      [{sf.severity}] {sf.kind}: {sf.detail}")
     if report.skipped:
         lines.append("")
