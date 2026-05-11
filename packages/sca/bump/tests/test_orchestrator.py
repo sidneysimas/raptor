@@ -735,6 +735,113 @@ def test_gha_upstream_404_falls_back_to_tags(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Helm chart deps (Phase 3.d)
+# ---------------------------------------------------------------------------
+
+def test_helm_chart_dependency_becomes_candidate(tmp_path: Path) -> None:
+    """``Chart.yaml`` with ``dependencies:`` pointing at an
+    out-of-date chart → bump candidate via the helm_index
+    lookup."""
+    # Helm parser needs PyYAML; skip if absent.
+    pytest.importorskip("yaml")
+    import yaml
+    (tmp_path / "Chart.yaml").write_text(
+        "apiVersion: v2\n"
+        "name: my-chart\n"
+        "version: 1.0.0\n"
+        "dependencies:\n"
+        "  - name: postgresql\n"
+        "    version: 13.4.4\n"
+        "    repository: https://charts.bitnami.com/bitnami\n"
+    )
+
+    # The bumper's helm walker calls http.get_bytes on the
+    # repo's index.yaml. Use a stub that delivers a
+    # YAML-encoded payload.
+    index_payload = yaml.safe_dump({
+        "apiVersion": "v1",
+        "entries": {
+            "postgresql": [
+                {"version": "13.4.4"},
+                {"version": "14.0.0"},
+            ],
+        },
+    }).encode()
+
+    class _StubHttpBytes(_StubHttp):
+        def get_bytes(self, url, **kw):
+            if url == "https://charts.bitnami.com/bitnami/index.yaml":
+                return index_payload
+            from core.http import HttpError
+            raise HttpError(f"no payload for {url}")
+
+    http = _StubHttpBytes({})
+    report = run_bump(tmp_path, http=http)
+    helm_cands = [c for c in report.candidates
+                   if c.kind == "helm_chart"]
+    assert len(helm_cands) == 1
+    c = helm_cands[0]
+    assert c.locator == "postgresql"
+    assert c.current_version == "13.4.4"
+    assert c.target_version == "14.0.0"
+    assert c.extra["repository"] == "https://charts.bitnami.com/bitnami"
+
+
+def test_helm_chart_apply_writes_chart_yaml(tmp_path: Path) -> None:
+    """End-to-end: ``--apply`` rewrites the Chart.yaml's
+    dependency version."""
+    pytest.importorskip("yaml")
+    import yaml
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "apiVersion: v2\n"
+        "name: my-chart\n"
+        "version: 1.0.0\n"
+        "dependencies:\n"
+        "  - name: redis\n"
+        "    version: 17.0.0\n"
+        "    repository: https://charts.example.com/\n"
+    )
+    index = yaml.safe_dump({
+        "apiVersion": "v1",
+        "entries": {"redis": [
+            {"version": "17.0.0"}, {"version": "18.0.0"},
+        ]},
+    }).encode()
+
+    class _StubHttpBytes(_StubHttp):
+        def get_bytes(self, url, **kw):
+            if url == "https://charts.example.com/index.yaml":
+                return index
+            from core.http import HttpError
+            raise HttpError(f"no payload for {url}")
+
+    http = _StubHttpBytes({})
+    run_bump(tmp_path, http=http, apply=True)
+    assert "version: 18.0.0" in chart.read_text()
+
+
+def test_helm_chart_without_repository_silently_skipped(
+    tmp_path: Path,
+) -> None:
+    """Vendored / file-based Chart.yaml deps lack a
+    ``repository`` URL — can't look up upstream. Silent skip."""
+    pytest.importorskip("yaml")
+    (tmp_path / "Chart.yaml").write_text(
+        "apiVersion: v2\n"
+        "name: parent\n"
+        "version: 1.0.0\n"
+        "dependencies:\n"
+        "  - name: child\n"
+        "    version: 1.0.0\n"
+    )
+    http = _StubHttp({})
+    report = run_bump(tmp_path, http=http)
+    assert [c for c in report.candidates
+             if c.kind == "helm_chart"] == []
+
+
+# ---------------------------------------------------------------------------
 # Render-side deduplication (Followup B)
 # ---------------------------------------------------------------------------
 

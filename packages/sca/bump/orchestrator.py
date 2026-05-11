@@ -292,6 +292,16 @@ def _enumerate_candidates(
     candidates.extend(yaml_candidates)
     skipped.extend(yaml_skipped)
 
+    # Helm chart deps (``Chart.yaml`` ``dependencies:`` block).
+    # Uses ``core/upstream_latest/helm_index`` for the index.yaml
+    # lookup against each chart's declared repository URL.
+    helm_candidates, helm_skipped = _enumerate_helm_chart_candidates(
+        target, http=http, cache=cache,
+        helm_cache=latest_cache,
+    )
+    candidates.extend(helm_candidates)
+    skipped.extend(helm_skipped)
+
     # GitHub Actions ``uses:`` refs — bump candidates from
     # ``.github/workflows/*.yml`` files. Phase 3.b ships tag-
     # pinned support only; SHA-pinned refs (raptor's convention)
@@ -600,6 +610,92 @@ def _enumerate_yaml_image_candidates(
                 current_version=current_tag,
                 target_version=target_tag,
                 upstream=None,
+            ))
+    return candidates, skipped
+
+
+def _enumerate_helm_chart_candidates(
+    target: Path,
+    *,
+    http,
+    cache,
+    helm_cache: dict,
+) -> Tuple[List[BumpCandidate], List[Tuple[str, Path, str]]]:
+    """Walk ``Chart.yaml`` dependencies via the existing Helm
+    parser. Each dep carries a Helm repo URL in
+    ``source_extra['repository']``; we query that repo's
+    ``index.yaml`` for the highest stable-semver version of the
+    named chart.
+
+    Skipped silently:
+      * Deps without a repository URL (vendored deps; can't look
+        up upstream)
+      * Deps whose current version isn't stable-semver (variant /
+        operator-internal pinning convention)
+
+    Skipped with explanation:
+      * Helm index fetch failures
+      * Chart name not present in the repo's index
+    """
+    from ..discovery import find_manifests
+    from ..parsers import parse_manifest
+    from core.upstream_latest._version_filter import parse_stable
+    from core.upstream_latest.github_releases import (
+        NoStableVersionsFound, UpstreamLookupError,
+    )
+    from core.upstream_latest.helm_index import latest_chart_version
+
+    candidates: List[BumpCandidate] = []
+    skipped: List[Tuple[str, Path, str]] = []
+    try:
+        manifests = find_manifests(target)
+    except Exception:                       # noqa: BLE001
+        return candidates, skipped
+    for manifest in manifests:
+        if manifest.path.name != "Chart.yaml":
+            continue
+        try:
+            deps = parse_manifest(manifest)
+        except Exception:                  # noqa: BLE001
+            continue
+        for dep in deps:
+            if dep.ecosystem != "Helm":
+                continue
+            current_version = dep.version or ""
+            if not current_version:
+                continue
+            if parse_stable(current_version) is None:
+                continue
+            repo = (dep.source_extra or {}).get("repository") if dep.source_extra else None
+            if not repo:
+                # No upstream URL → can't look up. Silent skip.
+                continue
+            cache_key = ("helm_index", repo, dep.name)
+            if cache_key in helm_cache:
+                target_version = helm_cache[cache_key]
+            else:
+                try:
+                    target_version = latest_chart_version(
+                        repo, dep.name, http=http, cache=cache,
+                    )
+                except (UpstreamLookupError, NoStableVersionsFound) as e:
+                    skipped.append((
+                        f"{dep.name} ({repo})", manifest.path,
+                        f"Helm index lookup failed: {e}",
+                    ))
+                    helm_cache[cache_key] = None
+                    continue
+                helm_cache[cache_key] = target_version
+            if not target_version or target_version == current_version:
+                continue
+            candidates.append(BumpCandidate(
+                kind="helm_chart",
+                locator=dep.name,
+                file=manifest.path,
+                current_version=current_version,
+                target_version=target_version,
+                upstream=None,
+                extra={"repository": repo},
             ))
     return candidates, skipped
 
