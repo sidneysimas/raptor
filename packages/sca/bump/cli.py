@@ -56,6 +56,20 @@ def main(argv: Sequence[str]) -> int:
         help="emit machine-readable JSON instead of the table",
     )
     parser.add_argument(
+        "--pr-comment", action="store_true",
+        help="emit GitHub-flavoured Markdown suitable for piping "
+             "into ``gh pr comment --body-file``. Verdict header "
+             "+ proposals table + supply-chain / new-CVE notes "
+             "per row.",
+    )
+    parser.add_argument(
+        "--repo-label", default=None,
+        help="header label for ``--pr-comment`` (default: "
+             "'raptor-sca bump'). Operators add commit SHAs / "
+             "repo names / PR numbers for at-a-glance attribution "
+             "in PR threads.",
+    )
+    parser.add_argument(
         "--no-cache", action="store_true",
         help="bypass cache for upstream-latest + registry lookups",
     )
@@ -129,6 +143,9 @@ def main(argv: Sequence[str]) -> int:
     if args.emit_json:
         sys.stdout.write(json.dumps(_report_to_dict(report), indent=2))
         sys.stdout.write("\n")
+    elif args.pr_comment:
+        from .pr_comment import render_pr_comment as _render_pr
+        sys.stdout.write(_render_pr(report, repo_label=args.repo_label))
     else:
         sys.stdout.write(render_report(report))
     return 0
