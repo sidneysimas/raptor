@@ -33,6 +33,9 @@ from typing import Dict, Optional, Tuple
 from core.dataflow.finding import Finding
 from core.dataflow.validator import ValidatorVerdict
 from packages.source_intel.analyze import (
+    GRADE_DOMINATES,
+    GRADE_SAME_FUNCTION,
+    GRADE_SAME_PATH,
     KIND_ACCESS,
     KIND_ALLOC_SIZE,
     KIND_MALLOC,
@@ -41,6 +44,7 @@ from packages.source_intel.analyze import (
     KIND_NORETURN,
     KIND_RETURNS_NONNULL,
     KIND_WUR,
+    AbortEvidence,
     AttributeEvidence,
     SourceIntelResult,
     analyze,
@@ -208,12 +212,27 @@ class SourceIntelValidator:
         finding: Finding,
         result: SourceIntelResult,
     ) -> ValidatorVerdict:
-        """Apply the verdict policy: EXPLOITABLE only when a relevant
-        attribute observation references a function named in the
-        finding's snippet AND the rule_id is kind-relevant. Otherwise
-        UNCERTAIN — Phase 2/3 never returns NOT_EXPLOITABLE."""
+        """Apply the verdict policy in two passes:
+
+        1. **Abort-dominance check (Phase 5a):** if an abort-class call
+           sits in the same function as the finding's sink AND the
+           finding's rule_id is memory-corruption-class, the bug
+           primitive aborts before exploitation — return
+           NOT_EXPLOITABLE. The Stage D LLM consumer can still see the
+           evidence in rendered strings and weigh it, but the validator
+           emits a confident negative verdict.
+
+        2. **Attribute-evidence check (Phase 3-3d):** EXPLOITABLE when
+           an attribute observation references a function named in the
+           finding's snippet AND the rule_id is kind-relevant.
+
+        Default: UNCERTAIN.
+        """
         if result.is_skipped:
             return ValidatorVerdict.UNCERTAIN
+
+        if _abort_dominates_finding(finding, result):
+            return ValidatorVerdict.NOT_EXPLOITABLE
 
         snippet = (
             (finding.source.snippet or "")
@@ -241,3 +260,102 @@ def _rule_id_is_relevant_for_kind(rule_id: str, kind: str) -> bool:
 def _rule_id_is_wur_relevant(rule_id: str) -> bool:
     """Back-compat shim — Phase 2 callers / tests."""
     return _rule_id_is_relevant_for_kind(rule_id, KIND_WUR)
+
+
+# Memory-corruption rule_id prefixes — findings in these CWE classes
+# may have their primitive aborted by an upstream abort-class call.
+# CWE-78 / CWE-89 (injection) findings don't benefit from this signal
+# because the exploitation primitive doesn't depend on continued
+# execution of the C-language process state.
+_MEMORY_CORRUPTION_RULE_PREFIXES: Tuple[str, ...] = (
+    "cpp/null-dereference",
+    "cpp/use-after-free",
+    "cpp/double-free",
+    "cpp/unbounded-write",
+    "cpp/uncontrolled-",
+    "c/null-dereference",
+)
+
+
+def _abort_dominates_finding(
+    finding: Finding,
+    result: SourceIntelResult,
+) -> bool:
+    """Return True iff axis-2 evidence supports NOT_EXPLOITABLE:
+
+    * finding's rule_id is memory-corruption-class, AND
+    * an abort-class call site sits in the same function as the
+      finding's sink (Phase 5a same_function grade is enough;
+      later phases will require same_path / dominates grade).
+
+    The finding's enclosing function is derived from sink (file, line)
+    via the same regex-based heuristic that ``analyze.py`` applies to
+    abort sites — both sides use the same logic so attributions match
+    when they exist.
+    """
+    rid = finding.rule_id or ""
+    if not any(rid.startswith(p) for p in _MEMORY_CORRUPTION_RULE_PREFIXES):
+        return False
+    if not result.aborts:
+        return False
+
+    sink_path = finding.sink.file_path or ""
+    sink_line = finding.sink.line or 0
+    if not sink_path:
+        return False
+
+    # Normalise sink_path to absolute so it can be compared against
+    # the abort's location (which carries the absolute path that
+    # analyze passed to spatch). Relative paths in Finding records
+    # are resolved against repo root.
+    sink_path_abs = sink_path
+    if not Path(sink_path).is_absolute():
+        sink_path_abs = str((_DEFAULT_REPO_ROOT / sink_path).resolve())
+
+    # Determine the finding's enclosing function (best-effort).
+    from packages.source_intel.analyze import _enclosing_function
+    finding_fn = _enclosing_function(sink_path_abs, sink_line) if sink_line else None
+
+    # Phase 5a: NOT_EXPLOITABLE requires same-function AND tight line
+    # proximity. `same_function` alone is too weak for big functions
+    # (kernel functions routinely run 4000+ lines, so an abort
+    # somewhere in the function doesn't dominate the bug primitive
+    # 3000 lines later). Documented in the abort_proximate.cocci
+    # rule header as a known limitation; later grades (`same_path`,
+    # `dominates`) computed by axis-2-expansion will drop this
+    # proximity requirement.
+    _SAME_FUNCTION_LINE_PROXIMITY = 50
+
+    for ab in result.aborts:
+        # Require the abort to be in the same file as the finding's
+        # sink (cross-file abort isn't proximate for our purposes).
+        abort_path, abort_line = ab.location
+        if abort_path != sink_path_abs:
+            continue
+        # Phase 5a grade gate — same_function with line proximity,
+        # or any stronger grade (same_path / dominates) when those
+        # ship in axis-2-expansion.
+        if ab.grade == GRADE_SAME_FUNCTION:
+            # Same-function + tight proximity → confident dominance.
+            if not sink_line:
+                continue
+            if abs(abort_line - sink_line) > _SAME_FUNCTION_LINE_PROXIMITY:
+                continue
+            # Both function names known: must match exactly.
+            if finding_fn and ab.enclosing_function:
+                if ab.enclosing_function == finding_fn:
+                    return True
+                continue
+            # At least one name unknown — accept on tight proximity
+            # alone. The line check (≤50) already filters out the
+            # mega-function false positives that motivated this gate.
+            return True
+        elif ab.grade in (GRADE_SAME_PATH, GRADE_DOMINATES):
+            # Stronger grades — function-name check is sufficient
+            # without the line-proximity gate (cocci has done the
+            # path-dominance work).
+            if finding_fn and ab.enclosing_function:
+                if ab.enclosing_function == finding_fn:
+                    return True
+
+    return False

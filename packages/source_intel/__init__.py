@@ -14,7 +14,11 @@ source_intel") for the design + axis roadmap.
 """
 
 from packages.source_intel.analyze import (
+    ALL_GRADES,
     ALL_KINDS,
+    GRADE_DOMINATES,
+    GRADE_SAME_FUNCTION,
+    GRADE_SAME_PATH,
     KIND_ACCESS,
     KIND_ALLOC_SIZE,
     KIND_MALLOC,
@@ -24,6 +28,7 @@ from packages.source_intel.analyze import (
     KIND_RETURNS_NONNULL,
     KIND_WUR,
     SCHEMA_VERSION,
+    AbortEvidence,
     AttributeEvidence,
     SourceIntelResult,
     WurEvidence,
@@ -38,9 +43,14 @@ from packages.source_intel.discovery import (
 from packages.source_intel.render import derive_evidence_strings
 
 __all__ = [
+    "ALL_GRADES",
     "ALL_KINDS",
+    "AbortEvidence",
     "AttributeEvidence",
     "DiscoveryResult",
+    "GRADE_DOMINATES",
+    "GRADE_SAME_FUNCTION",
+    "GRADE_SAME_PATH",
     "KIND_ACCESS",
     "KIND_ALLOC_SIZE",
     "KIND_MALLOC",

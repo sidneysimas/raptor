@@ -23,6 +23,9 @@ from typing import List, Optional
 
 from core.build.build_flags import BuildFlagsContext
 from packages.source_intel.analyze import (
+    GRADE_DOMINATES,
+    GRADE_SAME_FUNCTION,
+    GRADE_SAME_PATH,
     KIND_ACCESS,
     KIND_ALLOC_SIZE,
     KIND_MALLOC,
@@ -31,6 +34,7 @@ from packages.source_intel.analyze import (
     KIND_NORETURN,
     KIND_RETURNS_NONNULL,
     KIND_WUR,
+    AbortEvidence,
     AttributeEvidence,
     SourceIntelResult,
 )
@@ -82,7 +86,7 @@ def derive_evidence_strings(
         )
         return _truncate(lines, max_lines)
 
-    # Filter to the finding's function when supplied.
+    # Filter attributes to the finding's function when supplied.
     observations = list(result.attributes)
     if finding_function:
         observations = [
@@ -97,17 +101,76 @@ def derive_evidence_strings(
         if line is not None:
             lines.append(line)
 
+    # Abort evidence (axis 2). Filter to the finding's function when
+    # supplied (same composition as attributes). Strongest grade
+    # first so dominate-grade signal appears at the top.
+    aborts = list(result.aborts)
+    if finding_function:
+        aborts = [
+            ab for ab in aborts
+            if ab.enclosing_function == finding_function
+            or ab.enclosing_function is None
+        ]
+    _GRADE_ORDER = {
+        GRADE_DOMINATES: 0,
+        GRADE_SAME_PATH: 1,
+        GRADE_SAME_FUNCTION: 2,
+    }
+    aborts.sort(key=lambda ab: _GRADE_ORDER.get(ab.grade, 99))
+    for ab in aborts:
+        lines.append(_render_abort_line(ab, style))
+
     # When source_intel ran but found nothing relevant — emit an
     # explicit "no signal" line so the consumer prompt template
     # carries the absence acknowledgement.
     if not lines:
         lines.append(
-            "Source_intel ran; no attribute evidence for "
+            "Source_intel ran; no attribute or proximity evidence for "
             f"{finding_function or '<finding function>'}. "
             f"Absence of evidence is NOT evidence of unhardened code."
         )
 
     return _truncate(lines, max_lines)
+
+
+def _render_abort_line(ab: AbortEvidence, style: str) -> str:
+    """Render one abort-evidence observation."""
+    fn_text = (
+        f"function `{ab.enclosing_function}`"
+        if ab.enclosing_function
+        else f"in {ab.location[0]} near line {ab.location[1]}"
+    )
+    grade_phrase = {
+        GRADE_DOMINATES: "DOMINATES the sink line",
+        GRADE_SAME_PATH: "appears on the SmPL path between entry and sink",
+        GRADE_SAME_FUNCTION: "shares the function with the sink",
+    }.get(ab.grade, ab.grade)
+
+    if style == "stage_d":
+        prefix = "Control-flow signal — abort-class call near sink"
+    elif style == "exploit_plan":
+        prefix = "DoS-only constraint — abort proximate to sink"
+    else:
+        prefix = "Variant hint — abort proximity"
+
+    caveat = ""
+    if ab.conditional_on:
+        caveat = (
+            f" (CONDITIONAL: gated by `#if* {ab.conditional_on}` — "
+            f"downweight unless the actual build enables this.)"
+        )
+    if ab.grade == GRADE_SAME_FUNCTION:
+        caveat += (
+            " Grade `same_function` is weak: the abort may be on an "
+            "unrelated path within the function. Stronger grades "
+            "(`same_path`, `dominates`) require axis-2-expansion."
+        )
+    return (
+        f"{prefix}: `{ab.macro}` call at {ab.location[0]}:{ab.location[1]} "
+        f"{fn_text} — {grade_phrase}. If this abort is reached before "
+        f"the bug primitive, the program halts and the bug becomes "
+        f"DoS-only.{caveat}"
+    )
 
 
 def _render_attribute_line(

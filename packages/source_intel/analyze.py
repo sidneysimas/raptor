@@ -21,6 +21,7 @@ Hard invariants (carried from design):
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
@@ -63,6 +64,39 @@ ALL_KINDS: Tuple[str, ...] = (
     KIND_NO_STACK_PROTECTOR,
     KIND_ACCESS,
 )
+
+
+#: Proximity grades — ordered weakest → strongest. Phase 5a emits
+#: only "same_function"; later phases add "same_path" + "dominates".
+GRADE_SAME_FUNCTION = "same_function"
+GRADE_SAME_PATH = "same_path"
+GRADE_DOMINATES = "dominates"
+
+ALL_GRADES: Tuple[str, ...] = (
+    GRADE_SAME_FUNCTION,
+    GRADE_SAME_PATH,
+    GRADE_DOMINATES,
+)
+
+
+@dataclass(frozen=True)
+class AbortEvidence:
+    """A single observation of an abort-class call (BUG_ON, panic,
+    abort, __builtin_trap, _Exit, assert).
+
+    ``grade`` encodes how confidently the abort dominates a bug
+    primitive. Phase 5a emits only ``same_function`` grade.
+
+    The aggregator computes per-finding "is there an abort in the
+    finding's function?" lookups; the Validator's verdict policy
+    emits NOT_EXPLOITABLE on findings where the abort dominates.
+    """
+
+    macro: str  # which macro fired (BUG_ON, panic, …)
+    location: Tuple[str, int]  # (file_path, line)
+    grade: str  # one of ``ALL_GRADES``
+    enclosing_function: Optional[str] = None  # function name when known
+    conditional_on: Optional[str] = None  # surrounding #ifdef condition
 
 
 @dataclass(frozen=True)
@@ -134,6 +168,11 @@ class SourceIntelResult:
     #: headers, keyed by kind. Empty when discovery skipped (target
     #: had no headers or only the curated table was used).
     discovered_aliases: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+
+    #: Axis 2: abort-class call sites (BUG_ON, panic, abort, etc.)
+    #: with grading. Empty in Phase 2-4; Phase 5a populates from
+    #: abort_proximate.cocci output.
+    aborts: Tuple[AbortEvidence, ...] = ()
 
     @property
     def is_skipped(self) -> bool:
@@ -305,6 +344,7 @@ def analyze(
     rules_executed: List[str] = []
     rules_failed: List[Tuple[str, str]] = []
     observations: List[AttributeEvidence] = []
+    abort_observations: List[AbortEvidence] = []
 
     # spatch invocation per axis. ``no_includes=True`` matches the
     # existing PR-3 scan + PR-4 prereqs untrusted-target posture;
@@ -325,7 +365,10 @@ def analyze(
                     (result.rule, "; ".join(result.errors)[:500])
                 )
             for match in result.matches:
+                # The same parser dispatches by message prefix:
+                # attribute kinds → AttributeEvidence; abort → AbortEvidence.
                 observations.extend(_parse_match_to_attribute(match))
+                abort_observations.extend(_parse_match_to_abort(match))
 
     # Project-specific alias discovery: walk target headers, classify
     # `#define MACRO __attribute__((...))` patterns by family, count
@@ -358,6 +401,7 @@ def analyze(
         spatch_version=spatch_version(),
         attributes=tuple(observations),
         discovered_aliases=discovered_alias_tuple,
+        aborts=tuple(abort_observations),
     )
 
 
@@ -381,6 +425,113 @@ _KIND_TO_RAW_MATCH: Dict[str, str] = {
     KIND_NO_STACK_PROTECTOR: "__attribute__((no_stack_protector))",
     KIND_ACCESS: "__attribute__((access(...)))",
 }
+
+
+def _parse_match_to_abort(match: Any) -> List[AbortEvidence]:
+    """Convert a cocci :class:`SpatchMatch` from abort_proximate.cocci
+    into an :class:`AbortEvidence` record.
+
+    Cocci emits ``abort:<macro_name>``. The enclosing-function lookup
+    is best-effort via a Python-side regex on the source file —
+    cocci doesn't carry function context into the COCCIRESULT payload
+    in v1. The aggregator's per-finding lookup composes both.
+
+    Phase 5a hard-codes ``grade=same_function`` since path-domination
+    grading isn't computed yet.
+    """
+    msg = (getattr(match, "message", "") or "").strip()
+    if not msg.startswith("abort:"):
+        return []
+    macro = msg[len("abort:"):].strip()
+    if not macro:
+        return []
+    file_path = getattr(match, "file", "")
+    line_no = int(getattr(match, "line", 0))
+
+    enclosing_fn = _enclosing_function(file_path, line_no) if file_path else None
+
+    try:
+        from packages.source_intel.conditional import enclosing_condition
+        cond = enclosing_condition(file_path, line_no) if file_path else None
+    except ImportError:
+        cond = None
+
+    return [AbortEvidence(
+        macro=macro,
+        location=(file_path, line_no),
+        grade=GRADE_SAME_FUNCTION,
+        enclosing_function=enclosing_fn,
+        conditional_on=cond,
+    )]
+
+
+# Cache for per-file function bounds. Pattern matches a C function
+# definition opener: optional storage class / attributes / type, then
+# the name + `(`. Best-effort — we don't parse C, just locate function
+# openers by `^<name>(...)` optionally followed by `{` on the same
+# line (for one-line defs) or with no following `{` (multi-line where
+# the body opener is on a separate line). Lines ending with `;` are
+# rejected upstream (declarations, not definitions).
+_FUNC_DEF_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{]*?\)\s*\{?",
+)
+
+#: C keywords that look like function names to the naive regex above.
+#: Without filtering, `if (cond) { ... }` is mis-classified as a
+#: function definition named "if". Required-type-prefix check would
+#: be cleaner but the regex allows zero type prefixes for K&R-style
+#: defs (rare) — keep the regex permissive, reject these keywords
+#: post-hoc.
+_C_KEYWORDS: FrozenSet[str] = frozenset({
+    "if", "else", "while", "for", "switch", "case", "do", "return",
+    "goto", "break", "continue", "sizeof", "typeof", "static_assert",
+    "_Static_assert", "__builtin_expect", "likely", "unlikely",
+})
+
+
+def _enclosing_function(file_path: str, line: int) -> Optional[str]:
+    """Best-effort: find the C function definition enclosing ``line``.
+
+    Implementation: scan backward from ``line``, find the most recent
+    line that looks like a function definition opener (identifier
+    followed by parameter list, no semicolon at end). Returns the
+    function name or None when ambiguous.
+
+    NOT a C parser. Misses: K&R-style decls, function-pointer typedefs,
+    macros that expand to function-like things. Good enough for the
+    common case (kernel + curl follow standard ANSI C function decl
+    style); ambiguous cases return None which the aggregator handles
+    by leaving the abort un-attributed.
+    """
+    try:
+        with open(file_path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return None
+    if line < 1 or line > len(lines):
+        return None
+    # Walk backward looking for a likely function opener. Bound the
+    # walk so a malformed file doesn't take forever. ``range()`` end
+    # is exclusive — use -1 (or line-1-max_walk-1, whichever is larger)
+    # so we include lines[0].
+    max_walk = 1000
+    stop = max(-1, line - 1 - max_walk - 1)
+    for i in range(line - 1, stop, -1):
+        candidate = lines[i].rstrip("\n")
+        # Skip preprocessor lines, comments, declarations ending with ;
+        if candidate.lstrip().startswith(("#", "//", "/*", "*")):
+            continue
+        if candidate.rstrip().endswith(";"):
+            continue
+        m = _FUNC_DEF_RE.match(candidate)
+        if m:
+            name = m.group(1)
+            # Reject C keywords that look like function names —
+            # `if (cond) { ... }` regex-matches as "function `if`".
+            if name in _C_KEYWORDS:
+                continue
+            return name
+    return None
 
 
 def _parse_match_to_attribute(match: Any) -> List[AttributeEvidence]:
@@ -530,8 +681,7 @@ def _is_word_present(text: str, word: str) -> bool:
     """Word-boundary substring check. Avoids false positives where
     one macro name is a prefix of another (e.g. ``CHECK`` matching in
     ``CHECK_RETURN``)."""
-    import re as _re
-    return bool(_re.search(r"\b" + _re.escape(word) + r"\b", text))
+    return bool(re.search(r"\b" + re.escape(word) + r"\b", text))
 
 
 def _scan_alias_in_file(path: Path) -> List[AttributeEvidence]:
