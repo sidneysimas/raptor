@@ -412,6 +412,10 @@ def _try_cascade_batch(
             parents_by_name = _extract_pip_compile_via(
                 result.proposed_lockfile
             )
+        elif ecosystem == "npm":
+            parents_by_name = _extract_npm_lock_parents(
+                result.proposed_lockfile
+            )
         tagged = [
             _with_cascade_source(
                 d, host,
@@ -571,6 +575,47 @@ def _try_cascade(
         for d in deps
     ]
     return tagged, None
+
+
+def _extract_npm_lock_parents(blob: bytes) -> Dict[str, List[str]]:
+    """Extract child → [parents] map from a package-lock.json blob.
+
+    npm v2/v3 lockfile shape:
+      ``packages: {"": {...}, "node_modules/<pkg>": {dependencies: {...}}, ...}``
+    Each package entry's ``dependencies`` field lists its direct
+    requires (transitive children). We invert that to record the
+    PARENTS of each package, then the transitive-drop detector
+    can ask "if I bump <parent>, does <child> disappear?".
+
+    Returns lowercased names. The root entry ("") is the
+    user's own project — its declared deps are direct, not
+    transitives, so the root → child edges are excluded
+    (a transitive "via" listing the root would be misleading)."""
+    import json as _json
+    try:
+        data = _json.loads(blob)
+    except (ValueError, TypeError):
+        return {}
+    packages = data.get("packages") if isinstance(data, dict) else None
+    if not isinstance(packages, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for path, meta in packages.items():
+        if not isinstance(meta, dict):
+            continue
+        # Root entry has empty path; its deps are direct.
+        if path == "":
+            continue
+        parent_name = path.rsplit("node_modules/", 1)[-1]
+        if not parent_name:
+            continue
+        # Strip nested-namespace: ``node_modules/x/node_modules/y``
+        # means y is a child of x. The path's last segment is the
+        # package name; everything before identifies the parent.
+        for dep_name in (meta.get("dependencies") or {}):
+            child_canon = dep_name.lower()
+            out.setdefault(child_canon, []).append(parent_name.lower())
+    return out
 
 
 def _extract_pip_compile_via(blob: bytes) -> Dict[str, List[str]]:
