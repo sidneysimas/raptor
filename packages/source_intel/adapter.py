@@ -281,8 +281,24 @@ class SourceIntelValidator:
                 continue
             if ev.function_name not in snippet:
                 continue
-            if _rule_id_is_relevant_for_kind(finding.rule_id, ev.kind):
-                return ValidatorVerdict.EXPLOITABLE
+            if not _rule_id_is_relevant_for_kind(finding.rule_id, ev.kind):
+                continue
+            # Adversarial-tolerance guard for axis-1 WUR: refuse to
+            # fire EXPLOITABLE if the annotated function's body is
+            # trivial (no-op return-const) or returns the same
+            # literal on every path. Catches planted-WUR shapes
+            # the design's exit criterion identifies.
+            #
+            # Sophisticated adversaries with non-trivial bodies
+            # returning varying-but-meaningless values aren't
+            # detectable structurally — that's Stage D LLM's job.
+            # See README adversarial-tolerance section.
+            if ev.kind == KIND_WUR:
+                if not _wur_annotation_trustworthy(
+                    ev.location[0], ev.function_name,
+                ):
+                    continue
+            return ValidatorVerdict.EXPLOITABLE
 
         return ValidatorVerdict.UNCERTAIN
 
@@ -1334,3 +1350,208 @@ def _function_has_privileged_cap(
         if _line_uses_privileged_cap(cap_path, cap_line):
             return True
     return False
+
+
+# =====================================================================
+# Axis 1 adversarial-tolerance — WUR-annotation trust check
+# =====================================================================
+
+
+def _wur_annotation_trustworthy(file_path: str, function_name: str) -> bool:
+    """Return True iff the WUR annotation on ``function_name`` is
+    structurally trustworthy enough to drive an EXPLOITABLE verdict.
+
+    Two-layer adversarial defense:
+
+      1. **Triviality check** — locate the function's definition; if
+         the body has ≤2 statements, the function is a no-op and the
+         WUR annotation is suspect. Catches naive `return 0;` plants.
+
+      2. **Return-value constancy** — scan all `return ...;` statements
+         in the function body. If they're all the same literal
+         constant (`return 0;`, `return -1;`, `return NULL;`), the
+         return value carries no caller-actionable information.
+         Catches medium-difficulty plants with dead branches.
+
+    Returns False (annotation untrustworthy) when EITHER check fails;
+    True (trust the annotation) when both pass.
+
+    Conservative on failure: file unreadable or function definition
+    not found → returns True (preserve existing verdict behavior).
+
+    Known residual gap: sophisticated adversaries with non-trivial
+    bodies returning varying-but-meaningless values aren't
+    detectable structurally — that requires semantic understanding
+    of what the return value MEANS to callers. Stage D LLM is the
+    intended defense layer. Documented in README adversarial-
+    tolerance section.
+    """
+    if not file_path or not function_name:
+        return True
+
+    try:
+        with open(file_path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return True
+
+    # Find the function DEFINITION (not just declaration). Definition
+    # has body — must contain `{ ... }`. Declarations end with `;`.
+    fn_open_line = _find_function_definition_open(
+        lines, function_name,
+    )
+    if fn_open_line is None:
+        # No definition found — can't check body. Conservative: trust.
+        return True
+
+    # Find matching closing brace. Track brace depth from fn_open_line.
+    body_lines, body_close_line = _extract_function_body(
+        lines, fn_open_line,
+    )
+    if not body_lines:
+        return True
+
+    # Triviality check: count non-blank, non-comment, non-brace
+    # statement-bearing lines.
+    statement_count = _count_statements(body_lines)
+    if statement_count <= 2:
+        return False  # trivial body — don't trust WUR
+
+    # Return-value constancy check: scan all `return X;` patterns.
+    # Only suspect when EVERY return is a LITERAL (digit / NULL /
+    # nullptr / hex) AND they're all the same. A return like
+    # `return r;` (variable) is NOT a literal — caller might still
+    # need to inspect it, so the WUR annotation could be legitimate.
+    return_values = _extract_return_values(body_lines)
+    if return_values:
+        all_literal_same = (
+            all(_is_literal_const(v) for v in return_values)
+            and len(set(return_values)) == 1
+        )
+        if all_literal_same:
+            return False
+
+    return True
+
+
+_LITERAL_CONST_RE = re.compile(
+    r"^\s*(?:"
+    r"-?\d+[uUlL]*"          # decimal int (signed/unsigned/long)
+    r"|0[xX][0-9a-fA-F]+[uUlL]*"  # hex
+    r"|NULL"
+    r"|nullptr"
+    r"|\(void\s*\*\s*\)\s*0"     # (void *)0
+    r")\s*$"
+)
+
+
+def _is_literal_const(value: str) -> bool:
+    """Return True if ``value`` (a stripped return-expression) is a
+    literal constant — digit / hex / NULL / nullptr / (void *)0.
+    `return r;` where r is a variable returns False.
+    """
+    return bool(_LITERAL_CONST_RE.match(value))
+
+
+_FN_DEF_OPEN_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z_0-9*\s]*?\s+\*?\s*)?"  # optional return type
+    r"(?P<name>[A-Za-z_][A-Za-z_0-9]*)\s*\("
+)
+
+
+def _find_function_definition_open(
+    lines: list, function_name: str,
+) -> Optional[int]:
+    """Find the line where ``function_name``'s definition opens
+    (line containing `func_name(args) {` or where `{` is on the
+    next line). Returns 0-indexed line index, or None if not found.
+
+    A definition is distinguished from a declaration by the presence
+    of `{` on or after the function name (within a few lines). A
+    declaration ends with `;` on the same line.
+    """
+    for i, line in enumerate(lines):
+        m = _FN_DEF_OPEN_RE.match(line)
+        if not m or m.group("name") != function_name:
+            continue
+        # Walk forward looking for `{` (definition) or `;` (declaration).
+        # Strip comments first — `int foo(void) /* ... ; ... */` has `;`
+        # in the comment but is still a definition.
+        for j in range(i, min(i + 5, len(lines))):
+            stripped = re.sub(r"/\*.*?\*/", "", lines[j], flags=re.DOTALL)
+            stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
+            if "{" in stripped:
+                return j
+            if ";" in stripped and "{" not in stripped:
+                # Declaration, not definition — skip this match.
+                break
+    return None
+
+
+def _extract_function_body(
+    lines: list, fn_open_line: int,
+) -> Tuple[list, int]:
+    """Given the line index of a function-definition opener (line
+    containing `{`), extract the body lines (between `{` and
+    matching `}`). Returns (body_lines_list, close_line_index).
+    """
+    depth = 0
+    body = []
+    seen_open = False
+    for i in range(fn_open_line, len(lines)):
+        line = lines[i]
+        for ch in line:
+            if ch == "{":
+                depth += 1
+                seen_open = True
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and seen_open:
+                    return body, i
+        if seen_open:
+            body.append(line)
+    return body, len(lines) - 1
+
+
+def _count_statements(body_lines: list) -> int:
+    """Count C statement-bearing lines in a function body.
+
+    Heuristic: line is a statement if it ends in `;` after comment
+    stripping AND isn't a preprocessor directive AND isn't pure
+    declaration of a parameter. Doesn't try to be a parser.
+    """
+    count = 0
+    for line in body_lines:
+        stripped = re.sub(r"/\*.*?\*/", "", line, flags=re.DOTALL)
+        stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
+        stripped = stripped.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if stripped in ("{", "}", "{}"):
+            continue
+        if stripped.endswith(";"):
+            count += 1
+    return count
+
+
+_RETURN_VALUE_RE = re.compile(r"\breturn\s+([^;]+?)\s*;")
+
+
+def _extract_return_values(body_lines: list) -> list:
+    """Extract the right-hand side of every `return ...;` in the body.
+
+    Returns a list of normalized (whitespace-collapsed) strings.
+    Lines with bare `return;` (no value) are skipped — void-style
+    returns don't speak to return-value semantics.
+    """
+    values = []
+    for line in body_lines:
+        stripped = re.sub(r"/\*.*?\*/", "", line, flags=re.DOTALL)
+        stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
+        m = _RETURN_VALUE_RE.search(stripped)
+        if m:
+            val = re.sub(r"\s+", " ", m.group(1).strip())
+            values.append(val)
+    return values
