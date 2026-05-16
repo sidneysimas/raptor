@@ -1,25 +1,25 @@
-"""Regression: defusedxml must be installed and active for SCA XML parsing.
+"""Regression: defusedxml must be installed and active in the SCA POM parser.
 
-`requirements.txt` pins defusedxml so SCA pom.xml / .csproj parsing
-uses the safe parser. These tests fail loudly if a future install
-accidentally drops the pin or if defusedxml's billion-laughs defense
-regresses.
+The dedicated POM parser at ``packages/sca/parsers/pom.py`` uses
+defusedxml's ``ElementTree`` to read target-repo ``pom.xml`` files.
+These tests fail loudly if a future install accidentally drops the
+defusedxml pin or if its billion-laughs defense regresses.
+
+(Pre-feat/sca, POM parsing lived inline in ``packages/sca/agent.py``
+and the import flag was ``_DEFUSED_XML``. On feat/sca the parser
+lives in its own module and the flag is ``_AVAILABLE``.)
 """
 
+import importlib
 
-def test_defusedxml_is_pinned_and_importable():
-    """The dep must import cleanly — that's the structural pin check.
 
-    We deliberately don't probe a specific consumer module
-    (`packages.sca.agent`, `packages.sca.parsers.pom`, etc.) because
-    the SCA refactor in feat/sca migrates the defusedxml import from
-    the monolithic agent into per-ecosystem parsers. Testing the dep
-    itself is shape-agnostic and stays correct across that change.
-    """
-    import defusedxml  # noqa: F401
-    import defusedxml.ElementTree  # noqa: F401
-    assert defusedxml.__version__, (
-        "defusedxml imported but reports no version — install is broken."
+def test_sca_pom_parser_uses_defusedxml():
+    pom_parser = importlib.import_module("packages.sca.parsers.pom")
+    assert pom_parser._AVAILABLE, (
+        "packages.sca.parsers.pom fell back to xml.etree.ElementTree "
+        "because defusedxml is not installed. Pin "
+        "``defusedxml==0.7.1`` in requirements.txt — billion-laughs "
+        "payloads (CWE-776) expand on the stdlib parser."
     )
 
 
