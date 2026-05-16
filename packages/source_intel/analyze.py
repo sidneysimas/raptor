@@ -1029,7 +1029,13 @@ def _enclosing_function(file_path: str, line: int) -> Optional[str]:
         # Skip preprocessor lines, comments, declarations ending with ;
         if candidate.lstrip().startswith(("#", "//", "/*", "*")):
             continue
-        if candidate.rstrip().endswith(";"):
+        # Strip trailing comments before checking for `;` — a line
+        # `memcpy(buf, src, n);  /* note */` has the `;` mid-string
+        # but is NOT a function definition. Without this strip the
+        # candidate `endswith(";")` check misses call sites.
+        code_only = re.sub(r"/\*.*$", "", candidate)
+        code_only = re.sub(r"//.*$", "", code_only).rstrip()
+        if code_only.endswith(";"):
             continue
         m = _FUNC_DEF_RE.match(candidate)
         if m:

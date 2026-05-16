@@ -253,6 +253,11 @@ class SourceIntelValidator:
         if _privileged_capability_dominates(finding, result):
             return ValidatorVerdict.NOT_EXPLOITABLE
 
+        if _privilege_back_walk_suppresses(
+            finding, result, self._repo_root,
+        ):
+            return ValidatorVerdict.NOT_EXPLOITABLE
+
         if _fortify_source_blocks_finding(finding, result):
             return ValidatorVerdict.NOT_EXPLOITABLE
 
@@ -1220,4 +1225,112 @@ def _hazard_supports_finding(
             continue
         return True
 
+    return False
+
+
+# =====================================================================
+# Axis 4 expansion — 1-hop privilege back-walk
+# =====================================================================
+
+
+def _privilege_back_walk_suppresses(
+    finding: Finding,
+    result: SourceIntelResult,
+    repo_root: Path,
+) -> bool:
+    """Return True iff the finding's enclosing function is ONLY
+    reachable via callers that each have a privileged ``capable()``
+    check in their body.
+
+    1-hop scope: walks direct callers of the finding's function
+    via PR-4 prereqs; for each caller, checks whether that
+    caller's body contains a `capable(CAP_<PRIVILEGED>)` call
+    (using the same `_PRIVILEGED_CAP_FUNCTIONS` and
+    `_PRIVILEGED_CAP_CONSTANTS` sets as in-function axis-4).
+
+    Conservative: if PR-4 reports zero callers (finding function
+    is a top-level entry — handled by in-function axis-4), or
+    any direct caller LACKS a privileged gate, this back-walk
+    does NOT suppress. Single ungated path is enough to let the
+    finding through.
+
+    Limitations:
+      * 1-hop only — doesn't follow chains more than one caller
+        deep. Functions buried 2+ hops below an entry that's
+        gated will still be flagged.
+      * No CFG-aware "call site is downstream of capable()" check
+        — caller HAS capable() somewhere is enough. Could
+        over-suppress if the caller has multiple branches and
+        only one is gated.
+      * No support for indirect calls (function pointers / ops
+        vtables / macro-registered handlers).
+    """
+    rid = finding.rule_id or ""
+    if not any(rid.startswith(p) for p in _MEMORY_CORRUPTION_RULE_PREFIXES):
+        return False
+
+    try:
+        from packages.coccinelle.prereqs import gather_prereqs
+    except ImportError:
+        return False
+
+    sink_path = finding.sink.file_path or ""
+    sink_line = finding.sink.line or 0
+    if not sink_path or not sink_line:
+        return False
+
+    sink_path_abs = sink_path
+    if not Path(sink_path).is_absolute():
+        sink_path_abs = str((_DEFAULT_REPO_ROOT / sink_path).resolve())
+
+    from packages.source_intel.analyze import _enclosing_function
+    finding_fn = _enclosing_function(sink_path_abs, sink_line)
+    if not finding_fn:
+        return False
+
+    target = Path(sink_path_abs).parent
+    if not target.is_dir():
+        return False
+
+    facts = gather_prereqs(target)
+    if facts.is_skipped:
+        return False
+
+    callers = facts.callers_of(finding_fn)
+    if not callers:
+        # No callers seen — let in-function axis-4 handle this case.
+        return False
+
+    # For each call site, find its enclosing function. If ANY
+    # caller is NOT privileged-gated, return False — at least one
+    # ungated path reaches the finding.
+    for call_file, call_line in callers:
+        caller_fn = _enclosing_function(call_file, call_line)
+        if not caller_fn:
+            return False
+        if not _function_has_privileged_cap(caller_fn, result):
+            return False
+
+    return True
+
+
+def _function_has_privileged_cap(
+    fn_name: str,
+    result: SourceIntelResult,
+) -> bool:
+    """Check if ``fn_name`` has a privileged ``capable(CAP_X)`` call
+    site somewhere in its body.
+
+    Uses ``result.capabilities`` (already-cocci-detected capability
+    sites) + ``_line_uses_privileged_cap`` to verify the constant
+    on the matched line is in ``_PRIVILEGED_CAP_CONSTANTS``.
+    """
+    for cap in result.capabilities:
+        if cap.enclosing_function != fn_name:
+            continue
+        if cap.cap_function not in _PRIVILEGED_CAP_FUNCTIONS:
+            continue
+        cap_path, cap_line = cap.location
+        if _line_uses_privileged_cap(cap_path, cap_line):
+            return True
     return False
