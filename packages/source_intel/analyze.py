@@ -687,13 +687,94 @@ def _parse_match_to_abort(match: Any) -> List[AbortEvidence]:
     except ImportError:
         cond = None
 
+    grade = _classify_abort_grade(file_path, line_no)
+
     return [AbortEvidence(
         macro=macro,
         location=(file_path, line_no),
-        grade=GRADE_SAME_FUNCTION,
+        grade=grade,
         enclosing_function=enclosing_fn,
         conditional_on=cond,
     )]
+
+
+def _classify_abort_grade(file_path: str, abort_line: int) -> str:
+    """Best-effort structural classifier for axis-2 abort grade.
+
+    Reads the source file and inspects the brace-depth + control-flow
+    shape around the abort line to upgrade the default
+    ``same_function`` grade to ``same_path`` or ``dominates`` when
+    structural evidence supports it.
+
+    Heuristic:
+      * Walk backwards from abort_line to enclosing function ``{``.
+      * Track brace depth (function body = depth 1).
+      * If abort is at depth 1 AND no `return` / `goto` precedes it
+        at depth 1: grade = DOMINATES (abort runs on every path from
+        function entry to the abort line; nothing has returned
+        before).
+      * If abort is at depth > 1 (inside if/for/while): grade =
+        SAME_PATH (abort is on at least one branch; conservative
+        upgrade — it IS on a path, just not provably the only path).
+      * Else: SAME_FUNCTION (default).
+
+    Conservative on file-read failure or unparseable shape — returns
+    SAME_FUNCTION.
+    """
+    if not file_path or not abort_line:
+        return GRADE_SAME_FUNCTION
+    try:
+        with open(file_path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return GRADE_SAME_FUNCTION
+    if abort_line < 1 or abort_line > len(lines):
+        return GRADE_SAME_FUNCTION
+
+    abort_idx = abort_line - 1  # 0-indexed
+    # Walk backwards counting braces. We want the brace depth of the
+    # abort line, measured relative to the enclosing function's
+    # opening brace.
+    # Strategy: strip comments + scan from line 0 to abort_idx,
+    # tracking depth. depth at abort line is the abort's depth.
+    depth = 0
+    function_open_at: Optional[int] = None
+    saw_early_exit_at_depth_1 = False
+    bypass_re = re.compile(r"\b(?:return\b|goto\b)")
+
+    for i in range(0, abort_idx + 1):
+        line = lines[i]
+        # Strip comments (rough — same approach as adapter.py)
+        stripped = re.sub(r"/\*.*?\*/", "", line, flags=re.DOTALL)
+        stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
+
+        # Look for `return` / `goto` BEFORE the abort line at depth 1
+        # (function body), which would mean a normal exit path
+        # precedes the abort — abort no longer dominates.
+        if i < abort_idx and depth == 1 and bypass_re.search(stripped):
+            saw_early_exit_at_depth_1 = True
+
+        for ch in stripped:
+            if ch == "{":
+                depth += 1
+                if function_open_at is None and depth == 1:
+                    function_open_at = i
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    depth = 0
+
+    # If we never saw an opening brace, we're outside a function —
+    # default grade.
+    if function_open_at is None:
+        return GRADE_SAME_FUNCTION
+
+    abort_depth = depth
+    if abort_depth == 1 and not saw_early_exit_at_depth_1:
+        return GRADE_DOMINATES
+    if abort_depth > 1:
+        return GRADE_SAME_PATH
+    return GRADE_SAME_FUNCTION
 
 
 def _parse_match_to_capability(match: Any) -> List[CapabilityEvidence]:

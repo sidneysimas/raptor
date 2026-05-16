@@ -683,15 +683,22 @@ def _abort_dominates_finding(
     from packages.source_intel.analyze import _enclosing_function
     finding_fn = _enclosing_function(sink_path_abs, sink_line) if sink_line else None
 
-    # Phase 5a: NOT_EXPLOITABLE requires same-function AND tight line
-    # proximity. `same_function` alone is too weak for big functions
-    # (kernel functions routinely run 4000+ lines, so an abort
-    # somewhere in the function doesn't dominate the bug primitive
-    # 3000 lines later). Documented in the abort_proximate.cocci
-    # rule header as a known limitation; later grades (`same_path`,
-    # `dominates`) computed by axis-2-expansion will drop this
-    # proximity requirement.
-    _SAME_FUNCTION_LINE_PROXIMITY = 50
+    # Per-grade proximity gate:
+    #   * SAME_FUNCTION (default): ±50 line proximity — abort
+    #     somewhere in the function isn't enough on its own (kernel
+    #     functions routinely run thousands of lines).
+    #   * SAME_PATH (abort inside a conditional branch at depth>1):
+    #     ±300 line proximity — abort is provably on at least one
+    #     path; could still be a different branch from the bug.
+    #   * DOMINATES (abort at depth=1, no preceding return/goto):
+    #     no proximity gate — abort runs on every path from
+    #     function entry to its line, so anything in the same
+    #     function after the abort line is dominated.
+    _PROXIMITY_BY_GRADE: Dict[str, Optional[int]] = {
+        GRADE_SAME_FUNCTION: 50,
+        GRADE_SAME_PATH: 300,
+        GRADE_DOMINATES: None,  # no proximity gate
+    }
 
     for ab in result.aborts:
         # Require the abort to be in the same file as the finding's
@@ -699,33 +706,30 @@ def _abort_dominates_finding(
         abort_path, abort_line = ab.location
         if abort_path != sink_path_abs:
             continue
-        # Phase 5a grade gate — same_function with line proximity,
-        # or any stronger grade (same_path / dominates) when those
-        # ship in axis-2-expansion.
-        if ab.grade == GRADE_SAME_FUNCTION:
-            # Same-function + tight proximity → confident dominance.
+        proximity_gate = _PROXIMITY_BY_GRADE.get(
+            ab.grade, _SAME_FUNCTION_LINE_PROXIMITY_DEFAULT
+        )
+        if proximity_gate is not None:
             if not sink_line:
                 continue
-            if abs(abort_line - sink_line) > _SAME_FUNCTION_LINE_PROXIMITY:
+            if abs(abort_line - sink_line) > proximity_gate:
                 continue
-            # Both function names known: must match exactly.
-            if finding_fn and ab.enclosing_function:
-                if ab.enclosing_function == finding_fn:
-                    return True
+        # Function-name match — both must agree when both known.
+        # DOMINATES grade further requires the abort to be ABOVE
+        # the sink (an abort BELOW the bug can't dominate it).
+        if finding_fn and ab.enclosing_function:
+            if ab.enclosing_function != finding_fn:
                 continue
-            # At least one name unknown — accept on tight proximity
-            # alone. The line check (≤50) already filters out the
-            # mega-function false positives that motivated this gate.
-            return True
-        elif ab.grade in (GRADE_SAME_PATH, GRADE_DOMINATES):
-            # Stronger grades — function-name check is sufficient
-            # without the line-proximity gate (cocci has done the
-            # path-dominance work).
-            if finding_fn and ab.enclosing_function:
-                if ab.enclosing_function == finding_fn:
-                    return True
+        if ab.grade == GRADE_DOMINATES and sink_line:
+            if abort_line >= sink_line:
+                # Abort is at or below the sink → doesn't dominate.
+                continue
+        return True
 
     return False
+
+
+_SAME_FUNCTION_LINE_PROXIMITY_DEFAULT = 50
 
 
 # =====================================================================
