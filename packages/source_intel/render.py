@@ -76,12 +76,57 @@ class Mitigation:
 _STYLES = ("stage_d", "exploit_plan", "agentic_variant")
 
 
+# Stage E binary-verdict values that supersede source_intel's
+# EXPLOITABLE-leaning signal. Per design: "Binary observation
+# supersedes source intent when both available (Stage E binary wins)."
+# When the binary side says the bug can't reach exploitable runtime
+# (RELRO blocks GOT overwrite, no usable ROP, sanitizer in production
+# build, etc.), source_intel's structural evidence is reframed as
+# informational rather than verdict-bearing.
+#
+# Verdicts from ``packages.exploit_feasibility.api:analyze_binary``:
+#   "exploitable" | "likely_exploitable"  — binary agrees with EXPLOITABLE
+#   "blocked"                              — binary says NO
+#   "requires_environment"                 — binary says probably-NO
+_BINARY_SUPERSEDING_VERDICTS = frozenset({
+    "blocked",
+    "requires_environment",
+})
+
+
+def _supersession_prefix(binary_verdict: Optional[str]) -> Optional[str]:
+    """Return a one-line SUPERSEDED marker when the binary verdict
+    overrides source_intel; ``None`` otherwise.
+
+    Stage E semantics: binary observation always wins over source
+    intent when both are available. This prefix tells the consumer
+    LLM: "the following source_intel observations are factually
+    correct, but the binary side already proved the path isn't
+    exploitable — weigh them as context, not as exploitability
+    evidence."
+    """
+    if binary_verdict is None:
+        return None
+    if binary_verdict not in _BINARY_SUPERSEDING_VERDICTS:
+        return None
+    return (
+        f"SUPERSEDED: binary verdict `{binary_verdict}` from "
+        f"packages.exploit_feasibility — the following source_intel "
+        f"observations are STRUCTURALLY CORRECT but DO NOT change "
+        f"exploitability. Binary side already proved the primitive "
+        f"can't reach exploitable runtime. Treat the lines below as "
+        f"context for the verdict explanation, not as evidence "
+        f"for/against EXPLOITABLE."
+    )
+
+
 def derive_evidence_strings(
     result: SourceIntelResult,
     finding_function: Optional[str] = None,
     build_flags: Optional[BuildFlagsContext] = None,
     style: str = "stage_d",
     max_lines: Optional[int] = None,
+    binary_verdict: Optional[str] = None,
 ) -> List[str]:
     """Render source_intel evidence for a finding into prompt lines.
 
@@ -98,6 +143,15 @@ def derive_evidence_strings(
         PRs can diverge.
       max_lines: cap the number of returned lines (for context-tight
         prompt budgets); None = no cap.
+      binary_verdict: optional Stage E binary-side verdict from
+        :mod:`packages.exploit_feasibility`. Per design Stage E,
+        the binary observation supersedes source intent when both
+        are available. When this verdict is ``"blocked"`` or
+        ``"requires_environment"`` (binary says NOT exploitable),
+        the rendered output is prefixed with a SUPERSEDED marker
+        and reframed as informational-only: the LLM should weigh
+        the binary verdict over any source_intel EXPLOITABLE signal.
+        ``None`` (default): no binary side; emit unchanged.
 
     Returns an empty list when the result is skipped or carries no
     relevant evidence — consumers can render "no source_intel signal"
@@ -117,6 +171,12 @@ def derive_evidence_strings(
             f"Source_intel skipped: {result.skipped_reason}. "
             f"No evidence either way."
         )
+        # Stage E supersession still applies even when source_intel
+        # was skipped — the consumer needs to see the binary verdict
+        # disposition regardless.
+        prefix = _supersession_prefix(binary_verdict)
+        if prefix is not None:
+            lines = [prefix] + lines
         return _truncate(lines, max_lines)
 
     # Filter attributes to the finding's function when supplied.
@@ -187,6 +247,15 @@ def derive_evidence_strings(
             f"{finding_function or '<finding function>'}. "
             f"Absence of evidence is NOT evidence of unhardened code."
         )
+
+    # Stage E binary-supersedes (Phase C PR2). When the binary side
+    # says NOT exploitable, prepend a SUPERSEDED marker reframing
+    # everything below as informational. Always applies — even when
+    # only the "no signal" line was emitted — so the consumer sees
+    # the consistent "binary wins" disposition.
+    prefix = _supersession_prefix(binary_verdict)
+    if prefix is not None:
+        lines = [prefix] + lines
 
     return _truncate(lines, max_lines)
 

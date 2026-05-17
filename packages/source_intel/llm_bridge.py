@@ -97,6 +97,7 @@ def make_source_intel_collector(
     *,
     cache: Optional[Any] = None,
     repo_path_resolver: Optional[Callable[[Any, Path], Path]] = None,
+    binary_verdict_resolver: Optional[Callable[[Any, Path], Optional[str]]] = None,
     style: str = "stage_d",
     max_lines: int = DEFAULT_MAX_EVIDENCE_LINES,
 ):
@@ -114,7 +115,13 @@ def make_source_intel_collector(
        ``cache`` when provided to amortise across findings).
     3. Extracts build-flag context for the same target.
     4. Determines the sink's enclosing function (best-effort scan).
-    5. Renders evidence via
+    5. Optionally consults ``binary_verdict_resolver`` for the
+       per-finding Stage E binary verdict (see
+       :mod:`packages.exploit_feasibility`). When the resolver
+       returns a "blocked" / "requires_environment" verdict, the
+       rendered evidence is prefixed with a SUPERSEDED marker per
+       design Stage E ("binary observation supersedes source intent").
+    6. Renders evidence via
        :func:`packages.source_intel.render.derive_evidence_strings`
        and wraps as
        ``UntrustedBlock(kind="source-intel-evidence", origin="cocci-structural-evidence")``.
@@ -163,6 +170,9 @@ def make_source_intel_collector(
             sink_fn = _safe_enclosing_function(
                 dataflow.sink.file_path, dataflow.sink.line
             )
+            binary_verdict = _safe_binary_verdict(
+                binary_verdict_resolver, dataflow, scan_target
+            )
 
             lines = derive_evidence_strings(
                 result,
@@ -170,6 +180,7 @@ def make_source_intel_collector(
                 build_flags=flags,
                 style=style,
                 max_lines=max_lines,
+                binary_verdict=binary_verdict,
             )
             if not lines:
                 return None
@@ -265,4 +276,29 @@ def _safe_enclosing_function(file_path: str, line: int) -> Optional[str]:
         from packages.source_intel.analyze import _enclosing_function
         return _enclosing_function(file_path, line)
     except Exception:  # noqa: BLE001
+        return None
+
+
+def _safe_binary_verdict(
+    resolver: Optional[Callable],
+    dataflow,
+    scan_target: Path,
+) -> Optional[str]:
+    """Best-effort wrapper around an operator-supplied binary
+    verdict resolver.
+
+    Returns ``None`` when no resolver is configured or the resolver
+    raises (logged at debug level — the absence of a binary verdict
+    is the common case, not an error). The renderer's
+    ``binary_verdict=None`` branch then emits unchanged output.
+    """
+    if resolver is None:
+        return None
+    try:
+        return resolver(dataflow, scan_target)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "binary_verdict_resolver raised %s; "
+            "rendering without Stage E binary supersession", e,
+        )
         return None
