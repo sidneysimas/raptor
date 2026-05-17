@@ -106,6 +106,17 @@ class RunOptions:
                                          # network — auto-skipped under
                                          # ``--offline``. Disable via
                                          # ``--no-dockerfile-from``.
+    enable_image_drift: bool = False     # fingerprint each FROM / yaml
+                                         # image:'s main binary, compare
+                                         # vs stored baseline, emit
+                                         # image_capability_drift findings
+                                         # on bytes-changed-with-different-
+                                         # capabilities. Off by default
+                                         # (requires r2pipe or stdlib ELF
+                                         # parser; network egress to pull
+                                         # layers; per-cache-root baseline
+                                         # store). Auto-skipped under
+                                         # ``--offline``.
     use_offline_db: bool = False         # route ``--offline`` lookups
                                          # through OsvOfflineDB when set
     offline_db_path: Optional[Path] = None  # location of the sqlite3 DB;
@@ -407,6 +418,39 @@ def run_sca(
             )
             raw_deps.extend(base_image_deps)
 
+        # Capability-drift detection — opt-in. Fingerprints each
+        # image ref's main binary, compares vs the per-cache-root
+        # baseline. Emits a supply-chain finding when bytes
+        # changed AND capabilities differ (the legitimate-rebuild
+        # case is suppressed; only meaningful drift surfaces).
+        # The findings get folded into ``supply_chain_findings``
+        # below alongside the other supply-chain heuristics.
+        image_drift_findings = []
+        if options.enable_image_drift:
+            try:
+                from .image_drift import detect_image_drift
+                fingerprint_store = (
+                    options.cache_root or SCA_CACHE_ROOT
+                ) / "fingerprints"
+                image_drift_findings = detect_image_drift(
+                    target,
+                    oci_client=oci_client,
+                    fingerprint_store_dir=fingerprint_store,
+                )
+                if image_drift_findings:
+                    logger.info(
+                        "sca.pipeline: image-capability drift "
+                        "detected on %d ref(s)",
+                        len(image_drift_findings),
+                    )
+            except Exception:                          # noqa: BLE001
+                logger.warning(
+                    "sca.pipeline: image-drift detection failed",
+                    exc_info=True,
+                )
+    else:
+        image_drift_findings = []
+
     joined = join_deps(raw_deps)
     logger.info("sca.pipeline: %d manifests, %d deps after join",
                 len(manifests), len(joined))
@@ -438,6 +482,16 @@ def run_sca(
             cache=cache,
         )
         progress.done(f"{len(supply_chain_findings)} findings")
+
+    # Image-drift findings (from inside the dockerfile_from block
+    # above) fold into supply_chain_findings even when the
+    # other supply-chain heuristics are disabled — they're an
+    # independent opt-in signal and the operator explicitly
+    # enabled them.
+    if image_drift_findings:
+        supply_chain_findings.extend(image_drift_findings)
+
+    if options.enable_supply_chain:
 
         # 2a.0 — yanked-version detection. Cross-ecosystem; flags
         # exact-pinned deps whose registry marks them yanked.
