@@ -187,7 +187,8 @@ def run_bump(
     # who never enable the feature.
     oci_client = None
     if policy.binary_capability_delta_enabled and any(
-        c.kind in ("from_image", "yaml_image") for c in candidates
+        c.kind in ("from_image", "yaml_image", "gha_uses")
+        for c in candidates
     ):
         try:
             from core.oci.client import OciRegistryClient
@@ -210,6 +211,7 @@ def run_bump(
             now=now,
             rapid_release_days=policy.thresholds.rapid_release_days,
             oci_client=oci_client,
+            http=http,
             binary_capability_delta_enabled=(
                 policy.binary_capability_delta_enabled
             ),
@@ -657,6 +659,7 @@ def _evaluate_one(
     now: datetime,
     rapid_release_days: int = 30,
     oci_client=None,
+    http=None,
     binary_capability_delta_enabled: bool = False,
 ) -> BumpResult:
     """Compute the verdict for one bump candidate.
@@ -724,14 +727,17 @@ def _evaluate_one(
                     cand.locator, e,
                 )
     # Binary-capability-delta — opt-in fifth Tier-1 signal. Applies
-    # to image-shaped candidates (FROM image, yaml image). Pulls
-    # current + target main binaries via core.oci, runs the
-    # capability diff; high-severity finding when target adds exec
-    # or network capability that current didn't have.
+    # to image-shaped candidates (FROM image, yaml image) and to
+    # Docker-container GHA actions (gha_uses → resolve action.yml's
+    # ``runs.image``). Pulls current + target main binaries via
+    # core.oci, runs the capability diff; high-severity finding
+    # when target adds exec or network capability current didn't.
     if (binary_capability_delta_enabled and oci_client is not None
-            and cand.kind in ("from_image", "yaml_image")):
+            and cand.kind in (
+                "from_image", "yaml_image", "gha_uses",
+            )):
         bcd_finding = _binary_capability_delta_for_candidate(
-            cand, oci_client=oci_client,
+            cand, oci_client=oci_client, http=http,
         )
         if bcd_finding is not None:
             findings.append(bcd_finding)
@@ -752,24 +758,47 @@ def _evaluate_one(
 
 
 def _binary_capability_delta_for_candidate(
-    cand: BumpCandidate, *, oci_client,
+    cand: BumpCandidate, *, oci_client, http=None,
 ) -> Optional[SupplyChainFinding]:
     """Pull current + target main binaries from the candidate's
     image refs, run capability diff. Returns ``None`` on any
     routine failure (image unresolvable, binary not extractable,
     radare2 unavailable, no new capabilities).
 
-    For ``from_image`` candidates: locator is
-    ``"<registry>/<repository>"``; ref is ``"<locator>:<version>"``.
+    Candidate-kind mapping
+    - ``from_image`` / ``yaml_image``: locator is
+      ``"<registry>/<repository>"``; ref is ``"<locator>:<version>"``.
+    - ``gha_uses``: locator is the GitHub repo
+      ``"<owner>/<repo>"``; we fetch ``action.yml`` at the
+      current + target refs and resolve ``runs.image`` to an OCI
+      ref. Returns None for non-Docker actions (JS / composite)
+      and for Dockerfile-based actions (no pre-built image).
 
-    For ``yaml_image`` candidates: same shape (the yaml-image
-    enumerator builds locators in the same form).
+    Both halves must resolve cleanly — if the action SWITCHED
+    between Docker-flavoured and JS between versions, we can't
+    capability-diff (different shapes) and bail.
     """
     from .binary_capability_delta import binary_capability_delta_finding
     from .image_binary_extract import fetch_image_binary
 
-    current_ref = f"{cand.locator}:{cand.current_version}"
-    target_ref = f"{cand.locator}:{cand.target_version}"
+    ecosystem = "Container"
+    if cand.kind == "gha_uses":
+        ecosystem = "GHA"
+        if http is None:
+            logger.debug(
+                "sca.bump.binary_capability_delta: no http client "
+                "for gha_uses candidate %s", cand.locator,
+            )
+            return None
+        current_ref, target_ref = _resolve_gha_image_refs(
+            cand, http=http,
+        )
+        if current_ref is None or target_ref is None:
+            return None
+    else:
+        current_ref = f"{cand.locator}:{cand.current_version}"
+        target_ref = f"{cand.locator}:{cand.target_version}"
+
     current_bin = fetch_image_binary(
         current_ref, client=oci_client,
     )
@@ -789,13 +818,44 @@ def _binary_capability_delta_for_candidate(
         )
         return None
     return binary_capability_delta_finding(
-        ecosystem="Container",
+        ecosystem=ecosystem,
         name=cand.locator,
         current_version=cand.current_version,
         target_version=cand.target_version,
         current_binary=current_bin,
         target_binary=target_bin,
     )
+
+
+def _resolve_gha_image_refs(
+    cand: BumpCandidate, *, http,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve current + target image refs for a ``gha_uses``
+    candidate. Returns (None, None) for non-Docker actions or
+    fetch failures."""
+    from .gha_action_image import resolve_gha_action_image
+
+    current = resolve_gha_action_image(
+        cand.locator, cand.current_version, http=http,
+    )
+    if current is None:
+        logger.debug(
+            "sca.bump.binary_capability_delta: %s@%s is not a "
+            "resolvable Docker-container action",
+            cand.locator, cand.current_version,
+        )
+        return None, None
+    target = resolve_gha_action_image(
+        cand.locator, cand.target_version, http=http,
+    )
+    if target is None:
+        logger.debug(
+            "sca.bump.binary_capability_delta: %s@%s is not a "
+            "resolvable Docker-container action",
+            cand.locator, cand.target_version,
+        )
+        return None, None
+    return current.image_ref, target.image_ref
 
 
 def _enumerate_yaml_image_candidates(

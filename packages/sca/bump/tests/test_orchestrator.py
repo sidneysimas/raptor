@@ -1668,3 +1668,125 @@ class TestBinaryCapabilityDeltaWiring:
         assert calls["fetched"] == 1
         assert calls["detect"] == 0
         assert result.bump_supply_chain_findings == []
+
+    def test_gha_uses_docker_action_extracts_via_resolver(
+        self, tmp_path, monkeypatch,
+    ):
+        """``gha_uses`` candidates flow through
+        ``resolve_gha_action_image`` to map repo@ref → OCI image
+        ref, then through ``fetch_image_binary`` like any other
+        image candidate."""
+        from packages.sca.bump import orchestrator as orch_mod
+        from packages.sca.bump.gha_action_image import GhaActionImage
+        from packages.sca.models import (
+            Confidence, Dependency, PinStyle, SupplyChainFinding,
+        )
+
+        resolved = []
+        fetched = []
+
+        def fake_resolve(repo, ref, *, http):
+            resolved.append((repo, ref))
+            return GhaActionImage(
+                repo=repo, ref=ref,
+                image_ref=f"ghcr.io/{repo}:{ref}",
+            )
+
+        def fake_fetch(ref, *, client, **kwargs):
+            fetched.append(ref)
+            return tmp_path / f"binary-{ref.replace('/', '_')}"
+
+        sentinel_dep = Dependency(
+            ecosystem="GHA", name="some-org/docker-action",
+            version="v2", declared_in=Path("/<bump>"),
+            scope="main", is_lockfile=False,
+            pin_style=PinStyle.EXACT, direct=True,
+            purl="pkg:gha/some-org/docker-action@v2",
+            parser_confidence=Confidence("high", reason="test"),
+        )
+        sentinel = SupplyChainFinding(
+            finding_id="sca:bump:binary_capability_delta:gha",
+            kind="binary_capability_delta", dependency=sentinel_dep,
+            detail="test", evidence={}, severity="high",
+            confidence=Confidence("medium", reason="test"),
+        )
+
+        monkeypatch.setattr(
+            "packages.sca.bump.gha_action_image."
+            "resolve_gha_action_image",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            "packages.sca.bump.image_binary_extract.fetch_image_binary",
+            fake_fetch,
+        )
+        monkeypatch.setattr(
+            "packages.sca.bump.binary_capability_delta."
+            "binary_capability_delta_finding",
+            lambda **k: sentinel,
+        )
+
+        cand = orch_mod.BumpCandidate(
+            kind="gha_uses",
+            locator="some-org/docker-action",
+            file=tmp_path / "workflow.yml",
+            current_version="v1", target_version="v2",
+        )
+        result = orch_mod._evaluate_one(
+            cand, pypi_client=None, npm_client=None,
+            now=datetime(2026, 5, 17, tzinfo=timezone.utc),
+            oci_client=object(),
+            http=object(),
+            binary_capability_delta_enabled=True,
+        )
+        # Resolver called for both versions
+        assert resolved == [
+            ("some-org/docker-action", "v1"),
+            ("some-org/docker-action", "v2"),
+        ]
+        # OCI extractor called with the resolved image refs
+        assert fetched == [
+            "ghcr.io/some-org/docker-action:v1",
+            "ghcr.io/some-org/docker-action:v2",
+        ]
+        # Finding propagated to the result
+        assert any(
+            f.kind == "binary_capability_delta"
+            for f in result.bump_supply_chain_findings
+        )
+
+    def test_gha_uses_js_action_no_finding(
+        self, tmp_path, monkeypatch,
+    ):
+        """Non-Docker GHA action (resolver returns None) → no
+        OCI fetch, no finding."""
+        from packages.sca.bump import orchestrator as orch_mod
+
+        fetch_count = {"n": 0}
+        monkeypatch.setattr(
+            "packages.sca.bump.gha_action_image."
+            "resolve_gha_action_image",
+            lambda repo, ref, *, http: None,   # JS / composite
+        )
+        monkeypatch.setattr(
+            "packages.sca.bump.image_binary_extract.fetch_image_binary",
+            lambda *a, **k: (fetch_count.__setitem__(
+                "n", fetch_count["n"] + 1) or None),
+        )
+
+        cand = orch_mod.BumpCandidate(
+            kind="gha_uses", locator="actions/checkout",
+            file=tmp_path / "workflow.yml",
+            current_version="v3", target_version="v4",
+        )
+        result = orch_mod._evaluate_one(
+            cand, pypi_client=None, npm_client=None,
+            now=datetime(2026, 5, 17, tzinfo=timezone.utc),
+            oci_client=object(),
+            http=object(),
+            binary_capability_delta_enabled=True,
+        )
+        # Resolver returned None for current → bail before OCI
+        # fetch (and before resolving target).
+        assert fetch_count["n"] == 0
+        assert result.bump_supply_chain_findings == []
