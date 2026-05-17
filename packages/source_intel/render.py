@@ -234,8 +234,8 @@ def _render_abort_line(ab: AbortEvidence, style: str) -> str:
         else f"in {ab.location[0]} near line {ab.location[1]}"
     )
     grade_phrase = {
-        GRADE_DOMINATES: "DOMINATES the sink line",
-        GRADE_SAME_PATH: "appears on the SmPL path between entry and sink",
+        GRADE_DOMINATES: "DOMINATES the function body (depth-1, no early exit precedes)",
+        GRADE_SAME_PATH: "appears on a nested control-flow path (depth>1, inside if/loop/switch)",
         GRADE_SAME_FUNCTION: "shares the function with the sink",
     }.get(ab.grade, ab.grade)
 
@@ -251,6 +251,20 @@ def _render_abort_line(ab: AbortEvidence, style: str) -> str:
         caveat = (
             f" (CONDITIONAL: gated by `#if* {ab.conditional_on}` — "
             f"downweight unless the actual build enables this.)"
+        )
+    if ab.grade == GRADE_SAME_PATH:
+        # Phase C PR1: explicit weaker-than-dominates caveat.
+        # `same_path` means the abort sits inside a nested branch
+        # (depth>1) — execution that enters that branch DOES hit the
+        # abort, but other branches in the function bypass it. This
+        # is mid-strength evidence, NOT a guarantee like `dominates`.
+        caveat += (
+            " Grade `same_path` is mid-strength: the abort sits on "
+            "SOME control-flow path through the function but other "
+            "branches (else / loop fall-through / different switch "
+            "arms) bypass it. The bug primitive may reach runtime via "
+            "an unguarded branch. Stronger grade `dominates` (depth-1, "
+            "no early exit) would be needed to prove DoS-only outcome."
         )
     if ab.grade == GRADE_SAME_FUNCTION:
         caveat += (
