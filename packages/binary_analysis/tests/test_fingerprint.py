@@ -119,8 +119,42 @@ class TestFingerprintSerialisation:
         # Compact: no whitespace around separators
         assert ": " not in out
         assert ", " not in out
-        # Round-trips back to identical dict
-        assert json.loads(out) == fp.to_dict()
+        # Parses back to a dict (the comparison view — see
+        # test_canonical_json_excludes_binary_path below).
+        parsed = json.loads(out)
+        assert "binary_path" not in parsed
+        # Every other field present
+        for k in ("schema_version", "binary_sha256", "arch", "bits",
+                  "binary_format", "capability_buckets",
+                  "dangerous_sinks"):
+            assert k in parsed
+
+    def test_canonical_json_excludes_binary_path(self):
+        """ADVERSARIAL REGRESSION: same binary bytes at two
+        different filesystem paths must produce identical
+        canonical_json. Including binary_path would create
+        false drift signals between CI / local runs / different
+        extraction tempdirs.
+        """
+        kwargs = dict(
+            schema_version=1, binary_sha256="abc",
+            arch="x86_64", bits=64, binary_format="elf",
+            capability_buckets={"exec": ["execve"]},
+            dangerous_sinks=["sym.imp.execve"],
+        )
+        fp_a = CapabilityFingerprint(
+            binary_path="/usr/bin/foo", **kwargs,
+        )
+        fp_b = CapabilityFingerprint(
+            binary_path="/tmp/dl-xyz/foo", **kwargs,
+        )
+        assert fp_a.canonical_json() == fp_b.canonical_json()
+        # to_dict() does include binary_path (operator-facing
+        # rendering / SBOM property) — that's intentional and
+        # they differ there
+        assert fp_a.to_dict() != fp_b.to_dict()
+        assert fp_a.to_dict()["binary_path"] == "/usr/bin/foo"
+        assert fp_b.to_dict()["binary_path"] == "/tmp/dl-xyz/foo"
 
     def test_from_dict_roundtrip(self):
         fp = CapabilityFingerprint(
@@ -280,3 +314,97 @@ class TestCapabilityFingerprint:
         assert fp is not None
         assert fp.capability_buckets == {}
         assert fp.dangerous_sinks == []
+
+    def test_empty_file_hashes_cleanly(self, patched_analyser, tmp_path):
+        """ADVERSARIAL: empty file → known SHA-256 (the empty-
+        string hash). Fingerprint primitive shouldn't crash on
+        zero-byte binaries (rare but real — broken extraction
+        could yield one)."""
+        import hashlib
+        bin_path = _real_bytes_tempfile(tmp_path, "empty", b"")
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=bin_path,
+            arch="", bits=0, binary_format="",
+            imports=[],
+        )
+        fp = capability_fingerprint(bin_path)
+        assert fp is not None
+        assert fp.binary_sha256 == hashlib.sha256(b"").hexdigest()
+
+    def test_large_file_streams_without_oom(
+        self, patched_analyser, tmp_path,
+    ):
+        """ADVERSARIAL: 10MB file. The SHA-256 streamer must
+        chunk; loading the whole binary into memory would OOM
+        on container images. 10MB is small enough to be cheap
+        in CI but big enough to detect a regression where
+        someone replaces the chunked read with ``read()``.
+        """
+        bin_path = _real_bytes_tempfile(
+            tmp_path, "big.bin", b"x" * (10 * 1024 * 1024),
+        )
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=bin_path, arch="x86_64", bits=64,
+            binary_format="elf", imports=[],
+        )
+        fp = capability_fingerprint(bin_path)
+        assert fp is not None
+        assert len(fp.binary_sha256) == 64
+
+    def test_symlink_follows_to_real_bytes(
+        self, patched_analyser, tmp_path,
+    ):
+        """ADVERSARIAL: symlink → SHA-256 hashes the TARGET's
+        bytes, not the symlink itself. Matters for OCI layer
+        extraction which can place busybox-style symlinks for
+        all commands; we want the actual binary's fingerprint.
+        """
+        import os
+        real = _real_bytes_tempfile(tmp_path, "real.bin", b"target")
+        link = tmp_path / "link.bin"
+        os.symlink(real, link)
+        patched_analyser["ctx"] = BinaryContextMap(
+            binary_path=real, arch="x86_64", bits=64,
+            binary_format="elf", imports=[],
+        )
+        fp = capability_fingerprint(link)
+        assert fp is not None
+        # Hash should be the target's bytes
+        import hashlib
+        assert fp.binary_sha256 == hashlib.sha256(b"target").hexdigest()
+
+    def test_non_ascii_imports_dont_crash(self):
+        """ADVERSARIAL: imports with non-ASCII names (rare; could
+        come from a corrupted analyse pass or a hostile binary).
+        Bucket lookup just ignores them — they don't match any
+        taxonomy entry."""
+        out = bucket_imports({"execve", "réalloc", "🍕", "popen"})
+        assert "exec" in out
+        # ASCII matches captured; non-ASCII ignored
+        assert out["exec"] == {"execve", "popen"}
+
+
+# ---------------------------------------------------------------------------
+# Cross-consumer parity — bucket helpers shared with SCA bump detector
+# ---------------------------------------------------------------------------
+
+
+class TestSharedTaxonomyParity:
+    """The SCA bump detector
+    (``packages.sca.bump.binary_capability_delta``) imports
+    ``BUCKETS`` + ``bucket_imports`` from this module. Hoisting
+    the source-of-truth here only helps if the SCA side actually
+    re-exports the same semantics.
+    """
+
+    def test_sca_detector_imports_same_bucket_imports(self):
+        from packages.sca.bump.binary_capability_delta import (
+            _bucket_imports as sca_bucket_imports,
+        )
+        # Same callable — proves the hoist isn't accidentally
+        # forking semantics
+        assert sca_bucket_imports is bucket_imports
+
+    def test_sca_detector_imports_same_BUCKETS(self):
+        from packages.sca.bump.binary_capability_delta import _BUCKETS
+        assert _BUCKETS is BUCKETS

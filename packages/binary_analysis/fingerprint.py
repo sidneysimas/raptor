@@ -129,10 +129,14 @@ class CapabilityFingerprint:
     dangerous_sinks: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Stable JSON-ready representation. All list / dict
-        values are sorted so identical fingerprints serialise
-        identically — required for content-hash-based dedup
-        and for stable comparison."""
+        """Full JSON-ready representation INCLUDING the
+        informational ``binary_path``. For storage / operator-
+        facing rendering / SBOM property. Use
+        :meth:`canonical_json` (which drops binary_path) for
+        comparison / hashing — two fingerprints of the same
+        bytes from different filesystem paths should compare
+        equal, and they will via canonical_json but won't via
+        to_dict."""
         return {
             "schema_version": self.schema_version,
             "binary_path": self.binary_path,
@@ -147,6 +151,16 @@ class CapabilityFingerprint:
             },
             "dangerous_sinks": sorted(self.dangerous_sinks),
         }
+
+    def _comparison_dict(self) -> Dict[str, Any]:
+        """The fields that DEFINE this fingerprint's identity for
+        comparison / drift detection. Excludes ``binary_path``
+        (an operator-facing breadcrumb that legitimately varies
+        across machines / tempdirs for the same binary bytes —
+        including it would create false drift signals)."""
+        d = self.to_dict()
+        d.pop("binary_path", None)
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CapabilityFingerprint":
@@ -166,10 +180,17 @@ class CapabilityFingerprint:
         )
 
     def canonical_json(self) -> str:
-        """Sorted-keys JSON without whitespace variation. Stable
-        bytes for content-hashing or eq-comparison."""
+        """Stable bytes for content-hashing or eq-comparison
+        between fingerprints. Sorted keys, compact whitespace,
+        and EXCLUDES the informational ``binary_path`` so the
+        same binary bytes at two different filesystem paths
+        produce identical canonical_json (drift detection
+        depends on this — without it, comparing
+        ``/tmp/dl-abc/foo`` to ``/tmp/dl-xyz/foo`` for the same
+        image would always look like drift)."""
         return json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":"),
+            self._comparison_dict(),
+            sort_keys=True, separators=(",", ":"),
         )
 
 
