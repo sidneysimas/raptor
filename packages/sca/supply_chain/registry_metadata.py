@@ -76,9 +76,28 @@ def scan_deps(
     rest of the run.
     """
     now = now or datetime.now(timezone.utc)
-    direct_deps = [d for d in deps if d.direct]
-    if not direct_deps:
+    # Dedup by (ecosystem, name): monorepos with many package.json
+    # workspaces (Grafana, NX, Lerna) repeat the same direct-dep
+    # declaration across multiple manifests. Without dedup the
+    # ThreadPoolExecutor below launches one worker per occurrence,
+    # all of which miss the cache concurrently and fire the same
+    # HTTP request in parallel — a thundering-herd race observed
+    # on Grafana's 50+ workspace manifests during the May 2026
+    # 200-project sweep (single name produced 8 simultaneous 404s).
+    # Findings are emitted per-Dependency anyway: an upstream
+    # consumer that wants per-manifest evidence walks the orig
+    # ``deps`` list, not this one.
+    direct_deps_all = [d for d in deps if d.direct]
+    if not direct_deps_all:
         return []
+    seen_keys: set = set()
+    direct_deps: List[Dependency] = []
+    for d in direct_deps_all:
+        key = (d.ecosystem, d.name)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        direct_deps.append(d)
 
     def _scan_one(dep: Dependency) -> List[RegistryMetaFinding]:
         meta = _fetch(dep, pypi_client=pypi_client, npm_client=npm_client)

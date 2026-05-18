@@ -476,9 +476,25 @@ def enrich_licenses(
     pypi = PyPIClient(http=http, cache=cache, offline=offline)
     npm = NpmClient(http=http, cache=cache, offline=offline)
 
-    work = [d for d in deps if not d.declared_license]
-    if not work:
+    # Dedup by (ecosystem, name): monorepos with many workspace
+    # manifests repeat the same direct dep declaration. Without
+    # dedup the ThreadPoolExecutor below fires N concurrent
+    # registry lookups for the same name — a thundering-herd
+    # race observed during the May 2026 200-project sweep when
+    # Grafana's 50+ workspace manifests each declared the same
+    # ``@grafana/plugin-configs``. Same dedup pattern as
+    # ``supply_chain.registry_metadata.scan_deps``.
+    work_all = [d for d in deps if not d.declared_license]
+    if not work_all:
         return 0
+    _seen_lic: set = set()
+    work: List[Dependency] = []
+    for d in work_all:
+        key = (d.ecosystem, d.name)
+        if key in _seen_lic:
+            continue
+        _seen_lic.add(key)
+        work.append(d)
 
     def _enrich_one(d: Dependency) -> bool:
         try:
