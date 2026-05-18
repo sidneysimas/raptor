@@ -769,6 +769,14 @@ class TreeSitterExtractor:
             # C/C++: name is inside function_declarator
             if child.type == "function_declarator":
                 return self._get_name(child)
+            # C/C++: pointer-return functions wrap the
+            # function_declarator inside a pointer_declarator. Without
+            # this case, every `static char *foo(...)`-style decl is
+            # silently dropped from the inventory — surfaced by
+            # source_intel E2E on linux net/ (rc80211_minstrel_ht_debugfs.c
+            # `minstrel_ht_stats_csv_dump`).
+            if child.type == "pointer_declarator":
+                return self._get_name(child)
             # Go: name is inside field_identifier for methods.
             # C++: same node type covers in-class method declarations
             # (``void f();`` inside a class body has its name as

@@ -21,6 +21,7 @@ Hard invariants (carried from design):
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -682,6 +683,13 @@ def analyze(
     # if no subdirs are present, run rules from the dir directly.
     axis_dirs = _axis_dirs(effective_rules_root)
     rule_dirs = axis_dirs if axis_dirs else [effective_rules_root]
+
+    # Build + register the inventory for the target so the parser
+    # path's `_enclosing_function` lookups go through tree-sitter
+    # instead of the regex fallback. Best-effort — when inventory
+    # build raises, evidence parsing continues with the regex
+    # fallback path.
+    _maybe_register_inventory(target)
 
     rules_executed: List[str] = []
     rules_failed: List[Tuple[str, str]] = []
@@ -1439,10 +1447,142 @@ _C_KEYWORDS: FrozenSet[str] = frozenset({
 })
 
 
-def _enclosing_function(file_path: str, line: int) -> Optional[str]:
-    """Best-effort: find the C function definition enclosing ``line``.
+# Process-global cache of inventory dicts keyed by the absolute,
+# resolved target directory they were built for. Populated by
+# :func:`analyze` and consulted by :func:`_enclosing_function` when
+# the queried file lives under (or at) a cached target.
+#
+# Cache keys are absolute resolved paths. Lookups walk the file's
+# parent chain to find the deepest matching target — supports
+# nested analyze() calls on subdirectories.
+#
+# Why module-global: ``_enclosing_function`` is called from 15+
+# sites across analyze.py + adapter.py without a context-carrying
+# parameter. Threading inventory through every call site would
+# touch ~30 lines per consumer and break test mocks that don't
+# care about the inventory. The cache lets analyze() seed the
+# tree-sitter path while leaving the function signature and
+# behaviour identical for downstream code.
+_INVENTORY_BY_TARGET: Dict[str, Any] = {}
 
-    Algorithm:
+
+def _register_inventory(target: Path, inventory: Any) -> None:
+    """Stash an inventory for later ``_enclosing_function`` lookups.
+    Called by :func:`analyze` once per target before evidence
+    parsing. Idempotent — second call for the same target wins."""
+    try:
+        _INVENTORY_BY_TARGET[str(target.resolve())] = inventory
+    except (OSError, ValueError):  # unresolvable path → skip cache
+        pass
+
+
+def _maybe_register_inventory(target: Path) -> None:
+    """Best-effort: build the inventory for ``target`` and stash it
+    in the module-global cache so subsequent ``_enclosing_function``
+    queries route through tree-sitter (real C/C++ AST) instead of
+    the regex fallback.
+
+    Failure modes silently fall through (no inventory cached → regex
+    fallback handles the queries):
+      * :mod:`core.inventory` not importable (packaging strip / minimal install)
+      * tree-sitter grammars not installed (build still works but
+        returns regex-extracted items; still better than our walker
+        for split-type / pointer-return / multi-line cases)
+      * ``build_inventory`` raises (permission errors, malformed
+        files) — log at debug level, continue without inventory
+    """
+    try:
+        from core.inventory import build_inventory
+    except ImportError:
+        return
+    try:
+        inv = build_inventory(str(target))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "inventory build for %s failed (%s); "
+            "_enclosing_function will use regex fallback",
+            target, e,
+        )
+        return
+    _register_inventory(target, inv)
+
+
+def _lookup_cached_inventory(file_path: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Return ``(inventory, target_dir)`` for the deepest cached
+    target containing ``file_path``, or ``(None, None)`` if no
+    cached target is an ancestor.
+
+    Deepest-match wins so nested ``analyze()`` calls on
+    sub-projects route queries to the most specific inventory.
+    """
+    if not _INVENTORY_BY_TARGET:
+        return None, None
+    try:
+        fp = Path(file_path).resolve()
+    except (OSError, ValueError):
+        return None, None
+    best_target: Optional[str] = None
+    best_depth = -1
+    fp_str = str(fp)
+    for target in _INVENTORY_BY_TARGET:
+        # File is under target iff the resolved file path string
+        # starts with target + os.sep (or equals target for
+        # single-file targets — unusual but supported).
+        if fp_str == target or fp_str.startswith(target + os.sep):
+            depth = target.count(os.sep)
+            if depth > best_depth:
+                best_target = target
+                best_depth = depth
+    if best_target is None:
+        return None, None
+    return _INVENTORY_BY_TARGET[best_target], best_target
+
+
+def _enclosing_function_via_inventory(
+    file_path: str, line: int,
+) -> Optional[str]:
+    """Tree-sitter-backed enclosing-function lookup via the cached
+    inventory built in :func:`analyze`. Returns ``None`` when no
+    cached inventory covers ``file_path`` — caller falls back to
+    the regex walker.
+    """
+    inv, target_dir = _lookup_cached_inventory(file_path)
+    if inv is None:
+        return None
+    try:
+        from core.inventory.reachability import enclosing_function as _inv_enc
+    except ImportError:
+        return None
+    # Inventory keys files by the relative path from the target dir.
+    try:
+        rel = str(Path(file_path).resolve().relative_to(target_dir))
+    except (ValueError, OSError):
+        # File outside the cached target — shouldn't happen
+        # (_lookup_cached_inventory checked containment) but bail
+        # safely.
+        return None
+    try:
+        result = _inv_enc(inv, rel, line)
+    except Exception:  # noqa: BLE001
+        return None
+    return result.name if result is not None else None
+
+
+def _enclosing_function(file_path: str, line: int) -> Optional[str]:
+    """Find the C function definition enclosing ``line`` in ``file_path``.
+
+    Resolution order:
+      1. Tree-sitter inventory cache (preferred — real AST parse via
+         :mod:`core.inventory.extractors`, populated by :func:`analyze`).
+      2. Regex walker fallback (used when no inventory is cached for
+         the file's target — e.g. corpus-runner fixtures, tests).
+
+    The regex fallback is documented as best-effort and has historic
+    edge cases (multi-line decls, pointer-return types, split type/name
+    across lines, K&R decls). Inventory-backed resolution sidesteps
+    every one of those because tree-sitter parses real C.
+
+    Algorithm of the regex fallback (Phase B PR3 + post-E2E fixes):
       1. Walk backward from ``line``. Skip preprocessor lines,
          comment-only lines, and lines whose stripped form ends in
          ``;`` (declarations).
@@ -1456,11 +1596,17 @@ def _enclosing_function(file_path: str, line: int) -> Optional[str]:
          ``static CURLcode do_sendmsg(\\n    struct Curl_cfilter *cf,\\n    ...)``
          are matched once paren balance is reached on a later line.
 
-    NOT a full C parser — still misses: K&R-style decls,
-    function-pointer typedefs that look like calls. Good enough for
-    the kernel and curl-style ANSI C; ambiguous cases return None
-    which the aggregator handles by leaving the abort un-attributed.
+    NOT a full C parser — still misses (in fallback mode only):
+    K&R-style decls, function-pointer typedefs that look like calls,
+    split type+name across lines. Good enough for the kernel and
+    curl-style ANSI C; ambiguous cases return ``None`` which the
+    aggregator handles by leaving the abort un-attributed.
     """
+    # 1. Tree-sitter via cached inventory (preferred).
+    via_inv = _enclosing_function_via_inventory(file_path, line)
+    if via_inv is not None:
+        return via_inv
+    # 2. Regex fallback (only path when no inventory is cached).
     try:
         with open(file_path, "r", errors="replace") as f:
             lines = f.readlines()

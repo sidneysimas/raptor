@@ -1510,27 +1510,31 @@ def _wur_annotation_trustworthy(file_path: str, function_name: str) -> bool:
     if not file_path or not function_name:
         return True
 
-    try:
-        with open(file_path, "r", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return True
+    # Tree-sitter-backed body extraction via inventory (preferred).
+    # Falls back to the regex extractor when no inventory is cached
+    # for the file's target dir (e.g. corpus-fixture lookups, tests
+    # that pass synthetic file_paths). The regex path is robust on
+    # standard ANSI C but historically misses pointer-return funcs,
+    # split-type decls, and multi-line arg lists — all handled by
+    # the inventory's tree-sitter parser.
+    body_lines = _function_body_via_inventory(file_path, function_name)
+    if body_lines is None:
+        try:
+            with open(file_path, "r", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return True
 
-    # Find the function DEFINITION (not just declaration). Definition
-    # has body — must contain `{ ... }`. Declarations end with `;`.
-    fn_open_line = _find_function_definition_open(
-        lines, function_name,
-    )
-    if fn_open_line is None:
-        # No definition found — can't check body. Conservative: trust.
-        return True
+        fn_open_line = _find_function_definition_open(
+            lines, function_name,
+        )
+        if fn_open_line is None:
+            # No definition found — can't check body. Conservative: trust.
+            return True
 
-    # Find matching closing brace. Track brace depth from fn_open_line.
-    body_lines, body_close_line = _extract_function_body(
-        lines, fn_open_line,
-    )
-    if not body_lines:
-        return True
+        body_lines, _ = _extract_function_body(lines, fn_open_line)
+        if not body_lines:
+            return True
 
     # Triviality check: count non-blank, non-comment, non-brace
     # statement-bearing lines.
@@ -1572,6 +1576,72 @@ def _is_literal_const(value: str) -> bool:
     `return r;` where r is a variable returns False.
     """
     return bool(_LITERAL_CONST_RE.match(value))
+
+
+def _function_body_via_inventory(
+    file_path: str, function_name: str,
+) -> Optional[list]:
+    """Tree-sitter-backed body extraction via the cached inventory
+    populated by :func:`packages.source_intel.analyze.analyze`.
+
+    Returns the body lines (``line_start .. line_end`` slice of the
+    file, inclusive of signature) as a list of strings, or ``None``
+    when:
+      * no inventory is cached for the file's target dir, or
+      * the inventory doesn't contain a function with this name in
+        this file, or
+      * the file can't be read.
+
+    Caller falls back to the regex-based
+    :func:`_find_function_definition_open` + :func:`_extract_function_body`
+    pipeline on ``None``.
+
+    Note: signature lines (e.g. ``static char *``, ``foo(args)``,
+    ``{``) are included in the returned slice. The downstream
+    triviality + return-value heuristics tolerate them — signature
+    lines don't end in ``;`` and don't contain ``return`` so they
+    contribute zero to the counts.
+    """
+    from packages.source_intel.analyze import _lookup_cached_inventory
+    inv, target_dir = _lookup_cached_inventory(file_path)
+    if inv is None:
+        return None
+    try:
+        from pathlib import Path
+        rel = str(Path(file_path).resolve().relative_to(target_dir))
+    except (ValueError, OSError):
+        return None
+    # Find file record + named function item.
+    file_record = None
+    for fr in inv.get("files", []):
+        if fr.get("path") == rel:
+            file_record = fr
+            break
+    if file_record is None:
+        return None
+    for item in file_record.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") not in (None, "function"):
+            continue
+        if item.get("name") != function_name:
+            continue
+        line_start = item.get("line_start")
+        line_end = item.get("line_end")
+        if not isinstance(line_start, int) or line_start <= 0:
+            continue
+        if not isinstance(line_end, int) or line_end < line_start:
+            continue
+        try:
+            with open(file_path, "r", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return None
+        # Convert inventory 1-indexed inclusive range → 0-indexed slice.
+        if line_end > len(lines):
+            line_end = len(lines)
+        return lines[line_start - 1: line_end]
+    return None
 
 
 _FN_DEF_OPEN_RE = re.compile(
