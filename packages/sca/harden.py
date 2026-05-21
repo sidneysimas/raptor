@@ -465,6 +465,42 @@ def _plan_one(
             f"advisor{'y' if len(residual_advs) == 1 else 'ies'}: "
             f"{', '.join(residual_advs)}"
         )
+
+    # Full safety check — the "harden" promise. Beyond OSV/KEV/EPSS,
+    # consult the bump-tier supply-chain signals (recent_publish,
+    # maintainer_change, install_hook_suspicious, etc.) so a
+    # ``raptor-sca fix --harden`` doesn't promote to a version that
+    # would *worsen* security. Without this, harden could
+    # auto-promote a package to a version published 4 hours ago, or
+    # one that added a malicious ``postinstall`` — which would
+    # silently make the operator's tree LESS secure via a command
+    # called "harden". See
+    # ``project_harden_vs_bump_signal_gap.md`` for the design
+    # rationale. Only the deps actually being promoted pay the
+    # per-dep registry-metadata cost (~30-60s on a 200-dep project
+    # once a week — acceptable for the safety promise).
+    #
+    # ``offline`` skips this check (the metadata fetches can't run
+    # without network). There is deliberately NO ``--fast`` opt-out:
+    # operators who want the pure vuln-only path have
+    # ``raptor-sca fix --cve-only``; a fast-flag here would just be
+    # a footgun on a command named "harden".
+    if (target_status in ("promoted", "degraded_safety")
+            and not offline):
+        sc_findings = _evaluate_promotion_safety(
+            dep=dep, target_version=target_version,
+            registries=registries,
+        )
+        if sc_findings:
+            kinds = sorted({f.kind for f in sc_findings})
+            cand.status = "review_required"
+            existing_detail = cand.detail or ""
+            cand.detail = (
+                (existing_detail + "; " if existing_detail else "")
+                + f"promotion to {target_version} would emit "
+                f"{len(sc_findings)} supply-chain finding(s) "
+                f"({', '.join(kinds)}); operator review required"
+            )
     return cand
 
 
@@ -646,6 +682,96 @@ def _rank_candidates_by_safety(
             max_epss=_max_epss(advs, epss_scores),
         ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Full safety check — runs the bump-tier supply-chain evaluator on
+# every promotion candidate. See ``_plan_one`` for the design
+# rationale (the "harden" name promises the operator a safer tree
+# than the input; the vuln-only check alone doesn't deliver that).
+# ---------------------------------------------------------------------------
+
+# Supply-chain finding kinds that demote a promotion candidate to
+# ``review_required``. ``platform_compat_improvement`` is the
+# positive signal (target version supports MORE platforms than
+# current); excluded so we don't demote on strictly-better bumps.
+_DEMOTING_SUPPLY_CHAIN_KINDS = frozenset({
+    "recent_publish",
+    "maintainer_change",
+    "maintainer_account_change",
+    "install_hook_suspicious",
+    "platform_compat_regression",
+})
+
+
+def _evaluate_promotion_safety(
+    *,
+    dep: Dependency,
+    target_version: str,
+    registries: Dict[str, Any],
+) -> List[Any]:
+    """Run ``evaluate_bump_supply_chain`` for ``dep → target_version``.
+
+    Returns the subset of findings that should demote the candidate
+    (i.e., excludes ``platform_compat_improvement`` and anything not
+    in :data:`_DEMOTING_SUPPLY_CHAIN_KINDS`). Empty list = safe to
+    promote.
+
+    The evaluator's docstring already promises graceful degradation
+    on missing clients ("Missing clients or unsupported ecosystems
+    return an empty list"). We add a defensive ``hasattr`` guard
+    because harden's tests sometimes pass minimal ``_FakeRegistry``
+    stubs that don't implement ``get_metadata`` — passing those
+    through would AttributeError inside the evaluator. ``None`` is
+    the documented safe fallback.
+    """
+    if dep.version is None:
+        # No baseline to diff against — supply-chain delta detectors
+        # (maintainer_change, etc.) need a current version.
+        return []
+    try:
+        from .bump.evaluator import evaluate_bump_supply_chain
+    except ImportError:
+        # bump subpackage genuinely missing → can't check; safest
+        # response is "don't pretend to have checked".
+        logger.debug(
+            "sca.harden: bump.evaluator unavailable; promotion-safety "
+            "check skipped for %s:%s", dep.ecosystem, dep.name,
+        )
+        return []
+    pypi_client = registries.get("PyPI")
+    npm_client = registries.get("npm")
+    # Defensive: tests supply minimal stubs without ``get_metadata``.
+    # Treat those the same as missing-client (evaluator returns
+    # empty findings → safe-to-promote-by-default for this signal).
+    if pypi_client is not None and not hasattr(pypi_client, "get_metadata"):
+        pypi_client = None
+    if npm_client is not None and not hasattr(npm_client, "get_metadata"):
+        npm_client = None
+    try:
+        findings = evaluate_bump_supply_chain(
+            ecosystem=dep.ecosystem,
+            name=dep.name,
+            current_version=dep.version,
+            target_version=target_version,
+            pypi_client=pypi_client,
+            npm_client=npm_client,
+        )
+    except Exception as e:                          # noqa: BLE001
+        # Evaluator should be exception-safe for production callers,
+        # but in case any per-ecosystem detector raises on malformed
+        # metadata, fail closed: log + return empty (the candidate
+        # promotes via the OSV-only path). The alternative — demote
+        # everything on any evaluator hiccup — would be louder but
+        # too disruptive for routine ops.
+        logger.warning(
+            "sca.harden: supply-chain evaluator raised for %s:%s "
+            "(%s); promotion-safety check skipped", dep.ecosystem,
+            dep.name, e,
+        )
+        return []
+    return [f for f in findings
+            if f.kind in _DEMOTING_SUPPLY_CHAIN_KINDS]
 
 
 # ---------------------------------------------------------------------------

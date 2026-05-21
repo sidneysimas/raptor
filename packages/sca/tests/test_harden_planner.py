@@ -526,3 +526,137 @@ def test_plan_skips_commented_out_deps(
     assert "ghost-dep" not in names, (
         "harden must not propose bumps for commented-out deps"
     )
+
+
+# ---------------------------------------------------------------------------
+# Promotion-safety check (option 2c) — the "harden" promise
+# ---------------------------------------------------------------------------
+
+class _StubPyPIClient:
+    """Minimal PyPI client stub for the supply-chain evaluator path.
+
+    Harden first calls ``list_versions`` to enumerate candidates,
+    then ``_evaluate_promotion_safety`` calls ``get_metadata`` via
+    the bump-tier evaluator. The canned ``releases`` dict is
+    shaped like PyPI's JSON API; ``upload_time_iso_8601`` is what
+    the ``recent_publish`` detector reads.
+    """
+
+    def __init__(self, *, version: str, upload_iso: str,
+                 maintainers=("alice",)):
+        self._version = version
+        self._upload_iso = upload_iso
+        self._maintainers = list(maintainers)
+        self.ecosystem = "PyPI"
+
+    def list_versions(self, name: str) -> List[str]:
+        return [self._version]
+
+    def get_metadata(self, name: str) -> dict:
+        return {
+            "info": {"yanked": False, "maintainer": "alice"},
+            "releases": {
+                self._version: [{
+                    "upload_time_iso_8601": self._upload_iso,
+                    "url": f"https://example/{name}-{self._version}.whl",
+                    "filename": f"{name}-{self._version}.whl",
+                    "digests": {"sha256": "abc"},
+                    "size": 1234,
+                    "packagetype": "bdist_wheel",
+                    "python_version": "py3",
+                    "yanked": False,
+                }],
+            },
+        }
+
+
+def test_promotion_demoted_when_target_published_recently() -> None:
+    """The original ``semgrep 1.161.0 → 1.163.0`` case from the
+    2026-05-20 self-bump simulation: harden's OSV-only ranking says
+    Clean (no CVEs at 1.163.0); but the bump-tier
+    ``recent_publish`` detector says target was published ~now.
+    Post option-2c, harden mirrors bump's verdict and demotes to
+    ``review_required``."""
+    from datetime import datetime, timezone
+
+    dep = _dep(name="semgrep", version="1.161.0",
+                pin_style=PinStyle.EXACT)
+    # Target published RIGHT NOW (well within
+    # ``_RAPID_RELEASE_DAYS = 30``).
+    now_iso = datetime.now(timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+    pypi = _StubPyPIClient(version="1.163.0", upload_iso=now_iso)
+
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": pypi},
+        osv=_FakeOsv({"1.163.0": []}),  # No CVEs → OSV path = Clean.
+        offline=False, allow_major=False,
+    )
+
+    assert cand.status == "review_required"
+    assert cand.to_version == "1.163.0"
+    assert "recent_publish" in (cand.detail or ""), (
+        f"detail should cite the supply-chain finding kind; got: "
+        f"{cand.detail!r}"
+    )
+
+
+def test_promotion_not_demoted_when_target_published_long_ago() -> None:
+    """Counter-positive: target version published well outside the
+    rapid-release window → safety check passes → ``promoted``."""
+    from datetime import datetime, timedelta, timezone
+
+    dep = _dep(name="requests", version="2.30.0",
+                pin_style=PinStyle.EXACT)
+    long_ago_iso = (datetime.now(timezone.utc)
+                     - timedelta(days=365)).isoformat().replace(
+                         "+00:00", "Z")
+    pypi = _StubPyPIClient(version="2.33.0", upload_iso=long_ago_iso)
+
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": pypi},
+        osv=_FakeOsv({"2.33.0": []}),
+        offline=False, allow_major=False,
+    )
+
+    assert cand.status == "promoted"
+    assert cand.to_version == "2.33.0"
+
+
+def test_offline_skips_safety_check() -> None:
+    """``--offline`` can't run the metadata-fetch-driven
+    supply-chain detectors. Skip the check rather than fail-close
+    on every dep."""
+    dep = _dep(name="requests", version="2.30.0",
+                pin_style=PinStyle.EXACT)
+
+    cand = _plan_one(
+        dep,
+        # ``_FakeRegistry`` lacks ``get_metadata`` — would have
+        # AttributeError'd if the safety check ran.
+        registries={"PyPI": _FakeRegistry(["2.33.0"])},
+        osv=_FakeOsv({"2.33.0": []}),
+        offline=True, allow_major=False,
+    )
+
+    assert cand.status == "promoted"
+    assert cand.to_version == "2.33.0"
+
+
+def test_registry_stub_without_get_metadata_is_safe() -> None:
+    """Defensive: tests that pass a ``_FakeRegistry`` stub (no
+    ``get_metadata``) must not crash the safety check. The hasattr
+    guard in ``_evaluate_promotion_safety`` treats it as
+    missing-client → empty findings → safe-to-promote-by-default.
+    """
+    dep = _dep(name="requests", version="2.30.0",
+                pin_style=PinStyle.EXACT)
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": _FakeRegistry(["2.33.0"])},
+        osv=_FakeOsv({"2.33.0": []}),
+        offline=False, allow_major=False,
+    )
+    assert cand.status == "promoted"
