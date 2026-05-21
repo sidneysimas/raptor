@@ -1067,8 +1067,12 @@ def orchestrate(
             print("\n  Aggregate: skipped — requires at least two analysis models")
         else:
             aggregate_payload = _build_aggregation_payload(results_by_id, correlation)
+            # Pass `findings` so AggregationTask can pull SI evidence
+            # per memory-corruption finding for tie-breaking on
+            # disputed cases (see AggregationTask.build_prompt).
             aggregate_results = dispatch_task(
-                AggregationTask(profile=profile), [aggregate_payload], dispatch_fn,
+                AggregationTask(profile=profile, findings=findings),
+                [aggregate_payload], dispatch_fn,
                 role_resolution, results_by_id, cost_tracker, max_parallel,
             )
             for r in aggregate_results:
@@ -1103,7 +1107,15 @@ def orchestrate(
         print(f"\n  Structural grouping: {n} group{'s' if n != 1 else ''} found")
 
     # --- Group analysis ---
-    group_task = GroupAnalysisTask(results_by_id=results_by_id, profile=profile)
+    # Pass `findings` so GroupAnalysisTask can call
+    # evidence_blocks_for_finding per group member — surfaces shared-
+    # hazard patterns to the cross-finding analysis (e.g. "all 3
+    # group members hit strcpy in different functions"). Without
+    # `findings`, only analysis results are available, which lack
+    # repo_path + metadata.name needed by the SI cache lookup.
+    group_task = GroupAnalysisTask(
+        results_by_id=results_by_id, findings=findings, profile=profile,
+    )
     group_results = dispatch_task(
         group_task, groups, dispatch_fn, role_resolution,
         results_by_id, cost_tracker, max_parallel,
