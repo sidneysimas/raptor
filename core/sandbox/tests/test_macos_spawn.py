@@ -313,9 +313,15 @@ def test_audit_verbose_records_extended_categories(tmp_path):
     assert r.returncode == 0, (
         f"workload failed: stderr={r.stderr!r}"
     )
-    # Allow kernel→log→stream pipeline to flush.
-    time.sleep(2.0)
+    # Allow kernel→log→stream pipeline to flush. See the
+    # ``test_audit_mode_produces_denials_jsonl`` test for the
+    # full rationale on the poll-loop pattern vs. flat sleep.
     jsonl_path = audit_dir / ".sandbox-denials.jsonl"
+    _poll_deadline = time.monotonic() + 5.0
+    while time.monotonic() < _poll_deadline:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            break
+        time.sleep(0.05)
     assert jsonl_path.exists(), (
         "audit_verbose=True did not produce .sandbox-denials.jsonl"
     )
@@ -352,8 +358,16 @@ def test_audit_summary_record_emitted(tmp_path):
         audit_run_dir=str(audit_dir),
         capture_output=True, text=True, timeout=10,
     )
-    time.sleep(1.0)
+    # Poll-loop instead of flat sleep — same pattern as the
+    # other tests in this file. 3s budget (this assertion needs
+    # less than the kernel→log path because the audit summary
+    # is written from in-process at sandbox shutdown).
     jsonl_path = audit_dir / ".sandbox-denials.jsonl"
+    _poll_deadline = time.monotonic() + 3.0
+    while time.monotonic() < _poll_deadline:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            break
+        time.sleep(0.05)
     records = [json.loads(l) for l in
                 jsonl_path.read_text().splitlines() if l.strip()]
     summaries = [r for r in records if r.get("type") == "audit_summary"]

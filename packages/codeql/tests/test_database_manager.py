@@ -35,8 +35,25 @@ def _run_create(db_manager, tmp_path, command, language="javascript"):
     captured = {"cmd": [], "script_content": None, "script_mode": None}
 
     def fake_run(cmd, **kwargs):
+        # Return-shape-aware fake: pre-fix every invocation returned
+        # ``returncode=0, stdout="2.16.0"`` regardless of which codeql
+        # subcommand was being run. That meant ``codeql database
+        # create`` would "succeed" without producing any database
+        # files, and the test only passed because the surrounding
+        # mocks (``_count_database_files``, ``get_database_dir``)
+        # papered over the missing artefacts. A regression where
+        # ``database create`` started returning a CompletedProcess
+        # with empty stderr but non-zero rc would slip past the
+        # test silently. Differentiate by subcommand so each branch
+        # of the create_database control flow gets a realistic
+        # response shape and a future shape change surfaces as a
+        # test failure rather than a downstream production bug.
         # Only capture the database create call, not codeql version etc.
-        if "database" in cmd or "create" in cmd:
+        is_version_probe = "--version" in cmd
+        is_database_create = (
+            "database" in cmd and "create" in cmd
+        )
+        if is_database_create:
             captured["cmd"] = list(cmd)
             for arg in cmd:
                 p = Path(str(arg))
@@ -45,7 +62,21 @@ def _run_create(db_manager, tmp_path, command, language="javascript"):
                     captured["script_mode"] = p.stat().st_mode
         r = MagicMock()
         r.returncode = 0
-        r.stdout = "2.16.0"
+        if is_version_probe:
+            # ``codeql --version`` legitimately prints the version
+            # string and nothing else.
+            r.stdout = "2.16.0\n"
+            r.stderr = ""
+        elif is_database_create:
+            # ``codeql database create`` prints progress to stderr
+            # and a JSON-ish summary to stdout on success; empty
+            # stdout/stderr would be the bug shape we want to
+            # surface as a test failure if it ever appeared.
+            r.stdout = ""
+            r.stderr = "Initializing database at ...\nFinalizing database.\n"
+        else:
+            r.stdout = ""
+            r.stderr = ""
         return r
 
     db_path = tmp_path / "db"
