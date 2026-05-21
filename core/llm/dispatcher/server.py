@@ -46,7 +46,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 
@@ -302,29 +302,57 @@ class LLMDispatcher:
         return str(self.socket_path), read_fd
 
     def shutdown(self) -> None:
-        """Stop the server thread and remove the socket directory."""
+        """Stop the server thread and remove the socket directory.
+
+        Pre-fix every step silently swallowed any exception and the
+        audit event was emitted as ``status="ok"`` regardless. A
+        deadlocked-but-throwing ``server.shutdown()`` or an
+        ``unlink``/``rmdir`` blocked by a still-bound socket left the
+        dispatcher reporting clean stop while a tempdir leaked + the
+        process may have kept accepting on a half-shut server.
+        Each step's failure now logs at WARNING with the traceback,
+        and the audit event records ``status="partial"`` with a
+        reason summary when anything went wrong.
+        """
+        errors: List[str] = []
         try:
             self._server.shutdown()
         except Exception:
-            pass
+            _logger.warning(
+                "llm-dispatcher: server.shutdown() failed", exc_info=True,
+            )
+            errors.append("shutdown")
         try:
             self._server.server_close()
         except Exception:
-            pass
+            _logger.warning(
+                "llm-dispatcher: server.server_close() failed", exc_info=True,
+            )
+            errors.append("server_close")
         # Remove socket file then dir
         try:
             self.socket_path.unlink(missing_ok=True)
         except Exception:
-            pass
+            _logger.warning(
+                "llm-dispatcher: socket unlink failed for %s",
+                self.socket_path, exc_info=True,
+            )
+            errors.append("socket_unlink")
         try:
             self._sock_dir.rmdir()
         except Exception:
-            pass
+            _logger.warning(
+                "llm-dispatcher: sock_dir rmdir failed for %s "
+                "(leak — operator may need to clean manually)",
+                self._sock_dir, exc_info=True,
+            )
+            errors.append("sock_dir_rmdir")
         self._audit(AuditEvent(
             ts=time.time(), event="server.stop",
             peer_pid=None, peer_uid=None,
             token_id=None, worker_label=None,
-            status="ok",
+            status="ok" if not errors else "partial",
+            reason=",".join(errors) if errors else None,
         ))
 
     # ---- internal ----

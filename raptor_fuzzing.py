@@ -152,8 +152,16 @@ def main() -> None:
         llm = None
         try:
             llm = get_client()
-        except Exception:
-            pass
+        except Exception as e:
+            # Fall through to llm=None (orchestrator handles
+            # no-LLM mode) but surface why so operators can see
+            # whether a config issue is silently downgrading
+            # them to non-LLM fuzzing.
+            logger.debug(
+                "Fuzzing orchestrator: LLM client init failed: %s; "
+                "proceeding without LLM",
+                e,
+            )
 
         orch = FuzzingOrchestrator(llm=llm)
         plan = orch.plan(binary_path)

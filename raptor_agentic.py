@@ -81,8 +81,26 @@ def run_command_streaming(
                     if display.startswith("[INFO] "):
                         display = display[7:]
                     print(f"{prefix}{display}", flush=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Pre-fix the exception silently exited the reader thread.
+            # Parent never learned the child's output stopped
+            # streaming, and the consumed-but-not-stored output was
+            # dropped from run logs. Push a sentinel so the caller
+            # can detect truncation post-hoc, and surface the cause
+            # to stderr (loggers may not be configured at this depth
+            # of the call stack).
+            sentinel = (
+                f"[RAPTOR stream_output reader aborted: "
+                f"{type(exc).__name__}: {exc!s}]\n"
+            )
+            try:
+                storage.append(sentinel)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                print(sentinel, end="", file=sys.stderr, flush=True)
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             pipe.close()
 

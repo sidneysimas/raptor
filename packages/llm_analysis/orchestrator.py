@@ -250,8 +250,19 @@ def build_llm_config_from_flags(
     elif auto_detect:
         try:
             llm_config = LLMConfig()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Pre-fix this swallowed silently, leaving ``llm_config``
+            # at its prior value (potentially None) and the next
+            # code path crashed deeper without a breadcrumb. Log
+            # the cause so operators can diagnose "missing models"
+            # vs "malformed models.json" vs "init bug".
+            from core.logging import get_logger as _get_logger
+            _get_logger().warning(
+                "LLMConfig auto-detect failed: %s — falling back "
+                "to default (likely no models available)",
+                exc,
+                exc_info=True,
+            )
 
     # Consensus auto-defaults are redundant with 3+ analysis models
     # — the analysis models already provide independent opinions.
