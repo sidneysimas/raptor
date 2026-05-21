@@ -169,6 +169,80 @@ def test_sandbox_no_sandbox_overrides_profile(tmp_path: Path) -> None:
     assert (out / "findings.json").is_file()
 
 
+# ---------------------------------------------------------------------------
+# Regression backfill: bug shapes the dev-E2E sweep found 2026-05-21
+# that the original Tier-7 tests didn't pin.
+# ---------------------------------------------------------------------------
+
+@linux_only
+def test_sandbox_audit_engages_proxy_audit_log_mode(
+    tmp_path: Path,
+) -> None:
+    """Regression for the Tier-7 dev-E2E find (2026-05-21):
+    ``--audit`` was parsed at ``agent.py`` but never threaded
+    through to ``core.sandbox.context.sandbox`` — the flag was
+    silently inert. Operators passed it, got identical behaviour
+    to runs without it, and no engagement signal anywhere.
+
+    Fix in ``packages/sca/agent.py::_run_sandboxed`` to wire
+    ``audit=`` / ``audit_verbose=`` / ``audit_run_dir=`` through.
+    Post-fix, the canonical proxy banner ``"AUDIT-LOG mode"``
+    appears in stderr confirming the audit gate engaged. This
+    test pins the wiring by asserting the banner shows.
+
+    Works offline because the banner fires at sandbox setup
+    (when the audit ref-count is acquired), not on traffic."""
+    repo = tmp_path / "repo"
+    _build_fixture(repo)
+    out = tmp_path / "out"
+
+    proc = _run_agent([
+        "--repo", str(repo), "--out", str(out),
+        "--sandbox", "network-only", "--audit", "--offline",
+    ])
+    if proc.returncode != 0:
+        pytest.skip(
+            "sandbox composition not supported in CI; "
+            "audit-banner assertion deferred"
+        )
+    # Banner format (proxy.py:564): "...switched to AUDIT-LOG
+    # mode (CONNECT to non-allowlisted ...)". Substring check on
+    # the canonical phrase — robust to surrounding log formatting
+    # changes.
+    assert "AUDIT-LOG mode" in proc.stderr, (
+        "agent.py --audit didn't engage the proxy audit gate; "
+        "expected 'AUDIT-LOG mode' in stderr.\n"
+        f"stderr (last 2k):\n{proc.stderr[-2000:]}"
+    )
+
+
+@linux_only
+def test_sandbox_no_audit_does_not_engage_audit_mode(
+    tmp_path: Path,
+) -> None:
+    """Counterpart to the test above: WITHOUT ``--audit`` the
+    proxy gate must NOT switch to audit-log mode. Pins that the
+    flag is a real opt-in rather than something accidentally
+    engaged for every sandboxed run."""
+    repo = tmp_path / "repo"
+    _build_fixture(repo)
+    out = tmp_path / "out"
+
+    proc = _run_agent([
+        "--repo", str(repo), "--out", str(out),
+        "--sandbox", "network-only", "--offline",
+    ])
+    if proc.returncode != 0:
+        pytest.skip(
+            "sandbox composition not supported in CI"
+        )
+    assert "AUDIT-LOG mode" not in proc.stderr, (
+        "proxy audit gate engaged WITHOUT --audit; the flag "
+        "is supposed to be opt-in. stderr:\n"
+        f"{proc.stderr[-2000:]}"
+    )
+
+
 @pytest.mark.skipif(
     sys.platform == "linux", reason="non-Linux skip test only"
 )

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from packages.sca.models import PinStyle
 from packages.sca.parsers.nuget import (
     parse_lockfile,
@@ -131,6 +133,55 @@ def test_csproj_minimum_form(tmp_path: Path) -> None:
 def test_csproj_invalid_xml_returns_empty(tmp_path: Path) -> None:
     p = _write(tmp_path, "<Project><ItemGroup></Project>", "App.csproj")
     assert parse_msbuild_project(p) == []
+
+
+@pytest.mark.parametrize("spec", [
+    "(1.2.3)",   # exclusive on both sides + single value = empty interval
+    "[1.2.3)",   # inclusive lower, exclusive upper, single value = empty
+    "(1.2.3]",   # exclusive lower, inclusive upper, single value = empty
+])
+def test_csproj_pathological_brackets_classified_unknown(
+    tmp_path: Path, spec: str,
+) -> None:
+    """Regression for the 2026-05-21 lint-sweep find: only ``[V]``
+    (both inclusive, single value) is a valid EXACT pin per the
+    NuGet version-range spec. The pathological one-value forms
+    ``(V)`` / ``[V)`` / ``(V]`` describe empty intervals and
+    must NOT be classified as EXACT — otherwise the harden
+    planner would treat a malformed manifest entry as a
+    concrete pinned version and propagate the bad version
+    downstream. Pre-fix: ``_classify_version_spec`` extracted
+    both bracket tokens but ignored them, returning EXACT
+    whenever the regex matched a single value. Post-fix:
+    bracket tokens are checked; non-``[..]`` single-value forms
+    return ``PinStyle.UNKNOWN``."""
+    from packages.sca.parsers.nuget import _classify_version_spec
+
+    style, version = _classify_version_spec(spec)
+    assert style is PinStyle.UNKNOWN, (
+        f"pathological spec {spec!r} classified as {style!r} "
+        f"(should be UNKNOWN); version={version!r}"
+    )
+    # No concrete version pinned — the planner gets nothing to
+    # mistake for a real version.
+    assert version is None, (
+        f"pathological spec {spec!r} returned version={version!r} "
+        f"(should be None to prevent downstream propagation)"
+    )
+
+
+def test_csproj_canonical_single_value_still_exact(
+    tmp_path: Path,
+) -> None:
+    """Companion to the pathological-bracket test: ``[1.2.3]``
+    (the ONLY valid single-value form per spec) must still be
+    classified as EXACT. Pins the regression-fix didn't
+    over-correct into rejecting valid input."""
+    from packages.sca.parsers.nuget import _classify_version_spec
+
+    style, version = _classify_version_spec("[1.2.3]")
+    assert style is PinStyle.EXACT
+    assert version == "1.2.3"
 
 
 # ---------------------------------------------------------------------------

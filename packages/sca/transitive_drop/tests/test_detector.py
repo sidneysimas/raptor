@@ -532,6 +532,65 @@ def _version_key(v: str):
     return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
 
 
+def test_composer_dep_match_is_case_folded() -> None:
+    """Regression for the 2026-05-21 lint-sweep find:
+    ``_dep_state_composer`` defined ``transitive_canon =
+    transitive_name.lower()`` but used the raw mixed-case
+    ``transitive_name`` for the dict lookups against
+    ``require`` / ``require-dev`` / ``suggest``. A composer.json
+    with a mixed-case entry (``vendor/Package``) would silently
+    miss every check despite the canonical key being declared
+    just above.
+
+    Packagist enforces lowercase canonical names but hand-edited
+    ``composer.json`` blocks routinely carry mixed case;
+    matching case-folded is what every other ecosystem detector
+    in the same module does (npm / Cargo / NuGet / RubyGems).
+    Fix routes both sides of the comparison through
+    ``.lower()``."""
+    composer = _StubComposer({
+        # Parent declares the dep with a MIXED-CASE key, but our
+        # transitive lookup uses the lowercase canonical. The
+        # `_has` helper inside `_dep_state_composer` must
+        # case-fold both sides to find this match.
+        "vendor/parent": [
+            {"version": "1.0.0",
+             "require": {"vendor/MixedCase": "^1.0"}},
+            {"version": "2.0.0",
+             "require-dev": {"vendor/MixedCase": "^2.0"}},
+        ],
+    })
+    parent = Dependency(
+        ecosystem="Packagist", name="vendor/parent", version="1.0.0",
+        declared_in=Path("/test"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=True,
+        purl="pkg:composer/vendor/parent@1.0.0",
+        parser_confidence=Confidence("high", reason="test"),
+    )
+    transitive = Dependency(
+        # OUR canonical name uses lowercase — the standard form
+        # for transitive resolution. The detector must reconcile.
+        ecosystem="Packagist", name="vendor/mixedcase", version="1.0.0",
+        declared_in=Path("/test"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=False,
+        purl="pkg:composer/vendor/mixedcase@1.0.0",
+        parser_confidence=Confidence("high", reason="test"),
+        source_kind="cascade_resolver",
+        source_extra={"via": ["vendor/parent"]},
+    )
+    findings = detect_droppable_transitives(
+        [parent, transitive],
+        vuln_findings=[_vuln(transitive)],
+        composer_client=composer,
+    )
+    # Pre-fix: zero findings (case mismatch missed both lookups).
+    # Post-fix: the require-dev relocation is detected.
+    assert len(findings) == 1, (
+        f"case-folded composer match missed; got {findings!r}"
+    )
+    assert findings[0].extra_name == "require-dev"
+
+
 def test_composer_dep_moves_to_require_dev() -> None:
     composer = _StubComposer({
         "vendor/parent": [

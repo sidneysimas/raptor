@@ -312,6 +312,92 @@ def test_bump_empty_target_does_not_crash(tmp_path: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Regression backfill: bug shapes the dev-E2E sweep found 2026-05-21
+# that the original Tier-3 tests didn't pin.
+# ---------------------------------------------------------------------------
+
+def test_bump_proxy_allowlist_covers_helm_repository_hosts(
+    tmp_path: Path,
+) -> None:
+    """Regression for the Tier-3 dev-E2E find (2026-05-21):
+    ``compose_proxy_hosts`` walked Dockerfile FROM hosts but
+    skipped ``Chart.yaml`` ``dependencies[*].repository`` URLs.
+    Bumps to bitnami / ingress-nginx / argoproj repos got refused
+    at the egress proxy before the Helm-index fetch could run.
+
+    Fix in ``packages/sca/parsers/helm_chart.chart_repository_hosts``
+    + wired into ``packages.sca.compose_proxy_hosts``. This test
+    walks the bumper fixture (which carries a bitnami chart
+    dependency) and asserts the chart host is now in the
+    derived allowlist — driven through the public API rather
+    than the CLI so the assertion is precise without depending
+    on log-line wording."""
+    repo = tmp_path / "repo"
+    _build_bump_fixture(repo)
+
+    from packages.sca import compose_proxy_hosts
+    hosts = compose_proxy_hosts(repo)
+    assert "charts.bitnami.com" in hosts, (
+        f"chart_repository_hosts() didn't add charts.bitnami.com "
+        f"despite the fixture Chart.yaml referencing it; "
+        f"derived hosts: {sorted(hosts)}"
+    )
+
+
+def test_bump_pr_comment_lists_skipped_locators(
+    tmp_path: Path,
+) -> None:
+    """Regression for the Tier-3 dev-E2E find (2026-05-21): the
+    ``--pr-comment`` renderer used to emit only a skip COUNT
+    (``_Skipped: N surface(s)_``) without the per-surface
+    locator + reason. Operators reading the PR couldn't tell
+    what hadn't been bumped without re-running with ``-v``
+    locally.
+
+    The fixture below carries surfaces that bumper without
+    network can't resolve (Helm bitnami chart, GHA pin), so the
+    skipped block is exercised. We assert the new
+    ``<details>`` block + at least one per-surface locator
+    string from the fixture appears in the rendered output."""
+    repo = tmp_path / "repo"
+    _build_bump_fixture(repo)
+
+    proc = _run_bump([str(repo), "--pr-comment", "--no-cache"])
+    assert proc.returncode in (0, 1), (
+        f"unexpected exit {proc.returncode}; stderr:\n{proc.stderr}"
+    )
+    body = proc.stdout
+    # If anything got skipped, the rendered comment must use the
+    # ``<details>`` collapsing block AND mention at least one of
+    # the fixture's locators. If nothing got skipped (unlikely
+    # without network — bumper degrades the unresolvable refs)
+    # the assertion's premise doesn't hold; skip out cleanly.
+    if "Skipped:" not in body:
+        import pytest
+        pytest.skip("bump produced no skipped surfaces against "
+                    "this fixture in this environment")
+    assert "<details>" in body, (
+        "skipped surfaces rendered as count-only, missing "
+        f"<details> block. body:\n{body[:1000]}"
+    )
+    # At least one of the fixture's locators must show in the
+    # rendered skip detail — generalises across host/version
+    # differences in registry responses.
+    fixture_locator_hints = (
+        "redis", "actions/checkout", "actions/setup-python",
+        "vendor/lib", "semgrep",
+    )
+    matched = [
+        hint for hint in fixture_locator_hints if hint in body
+    ]
+    assert matched, (
+        f"--pr-comment skip section didn't surface any fixture "
+        f"locator; expected one of {fixture_locator_hints}, "
+        f"body:\n{body[:1500]}"
+    )
+
+
 def test_bump_missing_target_returns_error(tmp_path: Path) -> None:
     """Non-existent target → exit code 2 (argparse-ish), stderr
     contains a helpful message."""

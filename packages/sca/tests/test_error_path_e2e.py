@@ -258,3 +258,81 @@ def test_whatif_invalid_version_string_returns_error(tmp_path: Path) -> None:
                      "--offline"])
     # Tolerated: 1/2/3 (validation tier).  Crash codes not.
     assert proc.returncode in (1, 2, 3)
+
+
+# ---------------------------------------------------------------------------
+# Regression backfill: bug shapes the dev-E2E sweep found 2026-05-21
+# that the original Tier-4 tests didn't pin.
+# ---------------------------------------------------------------------------
+
+def test_report_surfaces_parser_warnings_section(tmp_path: Path) -> None:
+    """Regression for the Tier-4 dev-E2E find (2026-05-21):
+    parsers swallow malformed-input errors and return ``[]`` so
+    one bad manifest doesn't abort the run, but the report.md
+    used to say "0 deps analysed" with no on-report indication
+    that the file was unparseable. An operator scanning a tree
+    of corrupted manifests couldn't distinguish that from a
+    clean project.
+
+    Fix in ``packages.sca.parsers.capture_parse_failures`` +
+    ``packages.sca.report._render_parse_failures_section``. The
+    section must:
+      * appear in ``report.md`` when at least one parser failed
+      * cite the offending file path
+      * carry the canonical heading shape so operators can
+        ``grep '⚠ Parser warnings' report.md`` in CI logs"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Two malformed manifests — exercise both XML and JSON paths.
+    (repo / "pom.xml").write_text(
+        "<project><dependencies><dependency>BROKEN",
+        encoding="utf-8",
+    )
+    (repo / "Pipfile.lock").write_text(
+        "{ broken json", encoding="utf-8",
+    )
+
+    out = tmp_path / "out"
+    proc = _run_cli([str(repo), "--offline", "--out", str(out)])
+    assert proc.returncode in (0, 1), (
+        f"crash on malformed manifests: exit={proc.returncode}\n"
+        f"stderr (last 2k):\n{proc.stderr[-2000:]}"
+    )
+
+    report = out / "report.md"
+    assert report.is_file(), "report.md not emitted"
+    body = report.read_text(encoding="utf-8")
+    assert "Parser warnings" in body, (
+        "## ⚠ Parser warnings section missing from report.md "
+        "despite two malformed manifests. Body:\n"
+        f"{body[:2000]}"
+    )
+    # At least one of the malformed-manifest paths must be cited
+    # in the section — operators need to know WHICH file to fix.
+    assert ("pom.xml" in body) or ("Pipfile.lock" in body), (
+        f"Parser warnings section doesn't cite either malformed "
+        f"manifest path. Body:\n{body[:2000]}"
+    )
+
+
+def test_clean_run_has_no_parser_warnings_section(
+    tmp_path: Path,
+) -> None:
+    """Quiet output on the happy path: a tree with only well-
+    formed manifests must NOT have the parser-warnings section
+    in report.md — otherwise operators get noise on every clean
+    run."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text(
+        "requests==2.31.0\n", encoding="utf-8",
+    )
+
+    out = tmp_path / "out"
+    proc = _run_cli([str(repo), "--offline", "--out", str(out)])
+    assert proc.returncode in (0, 1)
+    body = (out / "report.md").read_text(encoding="utf-8")
+    assert "Parser warnings" not in body, (
+        f"clean run surfaced Parser-warnings section unexpectedly. "
+        f"Body:\n{body[:1500]}"
+    )
