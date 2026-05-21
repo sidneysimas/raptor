@@ -1,0 +1,16 @@
+# Files / paths semgrep should not scan as application code.
+# Inline ``# nosemgrep:`` directives are preferred for first-party
+# code; this file is reserved for non-code paths and third-party-
+# data mirrors where inline suppression isn't applicable.
+
+# Semgrep's own rule cache — these JSON files ARE detection regexes
+# for secrets / patterns and trigger their own rules. Not first-
+# party RAPTOR code.
+engine/semgrep/rules/registry-cache/
+
+# Operator-facing documentation explaining credential env-var
+# conventions. The ``service_account`` JSON in code-fences is a
+# placeholder shape for operators, not a real credential.
+# Markdown doesn't support inline ``# nosemgrep:`` directives the
+# way Python does.
+.claude/skills/oss-forensics/github-evidence-kit/SKILL.md

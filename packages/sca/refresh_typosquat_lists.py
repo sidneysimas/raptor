@@ -197,6 +197,10 @@ def refresh_all(
             out[fname] = "skipped"
             continue
         try:
+            # nosemgrep: sinks.raptor.web.ssrf.dynamic-url
+            # ``fetch`` callables hardcode their URLs (top of file
+            # ``_FETCHERS`` dict points each fname to a specific
+            # function with a literal URL). Not SSRF.
             names = fetch(http, top_n)
         except Exception as e:                  # noqa: BLE001
             logger.warning("%s fetch failed: %s", display, e)
