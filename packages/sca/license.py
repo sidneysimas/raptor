@@ -669,17 +669,28 @@ def _fetch_maven_license(
     return spdx
 
 
+try:
+    import defusedxml.ElementTree as _DET    # type: ignore[import-not-found]
+    _DEFUSEDXML_AVAILABLE = True
+except ImportError:                                # pragma: no cover
+    _DET = None                                    # type: ignore[assignment]
+    _DEFUSEDXML_AVAILABLE = False
+    logger.warning(
+        "sca.license: 'defusedxml' not installed — Maven POM license "
+        "extraction will be skipped. `pip install defusedxml` to "
+        "enable.",
+    )
+
+
 def _spdx_from_pom(pom_bytes: bytes) -> Optional[str]:
     """Parse a POM and extract the first license name, mapped to
     SPDX. Uses ``defusedxml`` when available (XXE / billion-laughs
     hardening), falls back to stdlib ``xml.etree.ElementTree``.
     """
+    if not _DEFUSEDXML_AVAILABLE:
+        return None
     try:
-        try:
-            import defusedxml.ElementTree as ET    # type: ignore[import-not-found]
-        except ImportError:
-            import xml.etree.ElementTree as ET     # type: ignore[no-redef]
-        root = ET.fromstring(pom_bytes)
+        root = _DET.fromstring(pom_bytes)
     except Exception:                                   # noqa: BLE001
         return None
 

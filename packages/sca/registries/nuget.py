@@ -20,6 +20,23 @@ from core.http import HttpClient
 logger = logging.getLogger(__name__)
 
 
+# defusedxml is required for safe ``.nuspec`` parsing. NuGet
+# responses come over HTTPS so the attacker model is registry-
+# compromise or MITM — lower risk than target-repo XML, but
+# defense-in-depth says use defusedxml. Refuse to parse without it.
+try:
+    from defusedxml.ElementTree import fromstring as _safe_xml_fromstring
+    _DEFUSEDXML_AVAILABLE = True
+except ImportError:                                  # pragma: no cover
+    _safe_xml_fromstring = None                      # type: ignore[assignment]
+    _DEFUSEDXML_AVAILABLE = False
+    logger.warning(
+        "sca.registries.nuget: 'defusedxml' not installed — NuGet "
+        "license / metadata fetches will be skipped. `pip install "
+        "defusedxml` to enable.",
+    )
+
+
 _CACHE_KEY_PREFIX = "nuget-versions"
 _DEFAULT_TTL = 24 * 3600
 
@@ -140,12 +157,10 @@ def _add_nuspec_methods():
             return None
         if resp.status_code != 200:
             return None
+        if not _DEFUSEDXML_AVAILABLE:
+            return None
         try:
-            try:
-                from defusedxml.ElementTree import fromstring as _xml
-            except ImportError:
-                from xml.etree.ElementTree import fromstring as _xml
-            root = _xml(resp.content)
+            root = _safe_xml_fromstring(resp.content)
         except Exception as e:                              # noqa: BLE001
             logger.warning(
                 "sca.registries.nuget: nuspec parse failed for "

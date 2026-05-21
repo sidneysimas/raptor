@@ -23,6 +23,46 @@ def test_sca_pom_parser_uses_defusedxml():
     )
 
 
+def test_sca_nuget_parser_uses_defusedxml():
+    """``.csproj`` / ``.fsproj`` / ``.vbproj`` files come from the
+    target repo. Without defusedxml, an attacker-controlled XXE
+    payload can exfil filesystem content or DoS the parser.
+    Surfaced 2026-05-21 by semgrep dogfood — historically silently
+    fell back to stdlib ``ElementTree``."""
+    nuget_parser = importlib.import_module("packages.sca.parsers.nuget")
+    assert nuget_parser._AVAILABLE, (
+        "packages.sca.parsers.nuget fell back to stdlib ElementTree "
+        "because defusedxml is not installed."
+    )
+
+
+def test_sca_license_pom_uses_defusedxml():
+    """Maven POM fetched from Maven Central for license extraction.
+    Trusted-network input, but defense-in-depth — refuse stdlib."""
+    lic = importlib.import_module("packages.sca.license")
+    assert lic._DEFUSEDXML_AVAILABLE, (
+        "packages.sca.license fell back to stdlib for POM parsing."
+    )
+
+
+def test_sca_maven_registry_uses_defusedxml():
+    """Maven Central POM parsed by the registry client. Same
+    defense-in-depth reasoning."""
+    mvn = importlib.import_module("packages.sca.registries.maven")
+    assert mvn._DEFUSEDXML_AVAILABLE, (
+        "packages.sca.registries.maven fell back to stdlib XML parser."
+    )
+
+
+def test_sca_nuget_registry_uses_defusedxml():
+    """``.nuspec`` from NuGet registry. Same defense-in-depth
+    reasoning."""
+    ng = importlib.import_module("packages.sca.registries.nuget")
+    assert ng._DEFUSEDXML_AVAILABLE, (
+        "packages.sca.registries.nuget fell back to stdlib XML parser."
+    )
+
+
 def test_defusedxml_rejects_billion_laughs():
     import defusedxml.ElementTree as DET
     from defusedxml import EntitiesForbidden

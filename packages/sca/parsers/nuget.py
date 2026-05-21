@@ -28,17 +28,34 @@ import logging
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple
+# ``_ET`` kept for its ``ParseError`` exception type — defusedxml
+# raises the stdlib's ParseError subclass on malformed XML, so
+# catching ``_ET.ParseError`` works for both parsers. The actual
+# parse goes through ``_safe_fromstring`` (defusedxml only).
 from xml.etree import ElementTree as _ET
-
-try:
-    from defusedxml.ElementTree import fromstring as _safe_fromstring
-except ImportError:                         # pragma: no cover
-    _safe_fromstring = _ET.fromstring       # type: ignore[assignment]
 
 from ..models import Confidence, Dependency, PinStyle
 from . import register
 
 logger = logging.getLogger(__name__)
+
+# ``.csproj`` / ``.fsproj`` / ``.vbproj`` files come from the target
+# repo, so an attacker-controlled XXE / billion-laughs payload could
+# DoS the parser or exfil filesystem content via external entities
+# on the stdlib parser. Require defusedxml; refuse to parse without
+# it. Mirrors the ``_AVAILABLE`` pattern in
+# ``packages/sca/parsers/pom.py``.
+try:
+    from defusedxml.ElementTree import fromstring as _safe_fromstring
+    _AVAILABLE = True
+except ImportError:                         # pragma: no cover — env-dependent
+    _safe_fromstring = None                 # type: ignore[assignment]
+    _AVAILABLE = False
+    logger.warning(
+        "sca.parsers.nuget: 'defusedxml' not installed — .csproj / "
+        ".fsproj / .vbproj files will be skipped. `pip install "
+        "defusedxml` to enable NuGet SCA coverage.",
+    )
 
 
 ECOSYSTEM = "NuGet"
@@ -59,6 +76,13 @@ def parse_msbuild_project(path: Path) -> List[Dependency]:
     (``<PackageReference Include="X"><Version>...</Version></PackageReference>``).
     Both forms supported.
     """
+    if not _AVAILABLE:
+        logger.warning(
+            "sca.parsers.nuget: skipping %s — 'defusedxml' not "
+            "installed; refusing to parse target-repo XML with the "
+            "stdlib parser (XXE / billion-laughs exposure)", path,
+        )
+        return []
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as e:
