@@ -1527,6 +1527,49 @@ class AutonomousSecurityAgentV2:
 
         unique_findings = prioritized_findings
 
+        # Phase D PR1: prime source_intel cache for sequential mode.
+        # Parallel / prep-only mode is handled by orchestrate() in the
+        # parent raptor_agentic.py process — priming there doesn't
+        # help THIS subprocess. Sequential mode (full LLM analysis
+        # happening here) needs the cache primed locally so
+        # ``tasks.py:evidence_blocks_for_finding`` finds populated
+        # state when each finding's prompt bundle is assembled.
+        #
+        # Pre-fix the per-finding ``evidence_blocks_for_finding``
+        # silently returned ``()`` because no caller had populated
+        # the cache for this subprocess — gap-#2-final-E2E surfaced
+        # the latent bug by observing zero source-intel-evidence
+        # blocks in an /agentic --sequential run despite the wiring
+        # being in place.
+        if not is_prep_only and self.repo_path:
+            logger.info(
+                "agent.py: priming source_intel cache for %s "
+                "(sequential-mode finding analysis)",
+                self.repo_path,
+            )
+            try:
+                from packages.llm_analysis.source_intel_inject import (
+                    prepare_source_intel,
+                )
+                prepare_source_intel(self.repo_path)
+            except Exception as e:  # noqa: BLE001
+                # Surface at INFO so the failure path is visible in
+                # operator logs — gap-#2 verification on /agentic
+                # subprocess made the prior debug-level log
+                # invisible, making "did this call run?" impossible
+                # to answer from the log alone.
+                logger.info(
+                    "agent.py: prepare_source_intel(%s) failed: %s — "
+                    "continuing without source_intel evidence",
+                    self.repo_path, e,
+                )
+        else:
+            logger.info(
+                "agent.py: skipping source_intel cache prime "
+                "(is_prep_only=%s, repo_path=%s)",
+                is_prep_only, self.repo_path,
+            )
+
         results = []
         analyzed = 0
         exploitable = 0
