@@ -367,8 +367,15 @@ def generate_sample_config() -> str:
 
     # Add a commented example showing how to add an API key.
     # Our JSON parser strips // comments, so this is safe to copy-paste.
+    #
+    # NB the example uses ``"REDACTED"`` rather than ``"sk-ant-..."``
+    # — operators occasionally pasted the literal "..." form into
+    # models.json verbatim. The dispatcher then sent that obvious
+    # placeholder to Anthropic in the Authorization header, which
+    # rejects it with 401. The new placeholder reads as clearly
+    # non-functional and points to the env-var path as the default.
     raw += "\n// To add API keys inline (alternative to env vars):\n"
-    raw += '// {"provider": "anthropic", "model": "claude-opus-4-6", "api_key": "sk-ant-..."}\n'
+    raw += '// {"provider": "anthropic", "model": "claude-opus-4-6", "api_key": "REDACTED — copy your real key here"}\n'
 
     return raw
 
