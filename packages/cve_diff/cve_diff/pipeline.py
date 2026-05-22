@@ -419,7 +419,14 @@ class Pipeline:
         consistently. No-op when multiplier is 1.0.
         """
         m = self.agent_budget_multiplier
-        if m == 1.0:
+        # Use math.isclose for FP-precision equality. Pre-fix
+        # ``m == 1.0`` failed on a multiplier computed from
+        # arithmetic that landed at 0.9999... (operator-supplied
+        # ratio that went through a normalisation pass); we then
+        # silently scaled the budgets by a near-1.0 factor producing
+        # a config that looked re-scaled to no purpose.
+        import math
+        if math.isclose(m, 1.0, rel_tol=1e-9, abs_tol=1e-9):
             return config
         return replace(
             config,

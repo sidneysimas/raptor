@@ -300,7 +300,13 @@ class LLMProvider(ABC):
         rates = MODEL_COSTS.get(self.config.model_name)
         if not rates:
             rate = self.config.cost_per_1k_tokens or 0.0
-            if rate == 0.0:
+            # ``math.isclose`` with abs_tol collapses ±epsilon to
+            # "zero" — pre-fix ``rate == 0.0`` missed the warning
+            # when ``cost_per_1k_tokens`` was a computed near-zero
+            # float (e.g. a tiny config value or arithmetic result
+            # that didn't land exactly on the int representation).
+            import math
+            if math.isclose(rate, 0.0, abs_tol=1e-12):
                 self._warn_unknown_model_once(self.config.model_name)
             return ((input_tokens + output_tokens + thinking_tokens) / 1000) * rate
         return (
