@@ -281,6 +281,19 @@ def load_index(fingerprint: Optional[str]) -> Optional["_AdjacencyIndex"]:
         )
         return None
     try:
+        # nosemgrep: python.lang.security.deserialization.pickle.avoid-pickle
+        # Trust analysis: cache path is ``~/.cache/raptor/
+        # reachability/<fingerprint>.bin`` — RAPTOR's own cache dir
+        # under the operator's home. Files are created with mode
+        # ``0o600`` (owner-only) via O_EXCL atomic write
+        # (no symlink-following). A magic-prefix sentinel
+        # (``_HEADER_MAGIC``) guards format; mismatched files skip
+        # the pickle path entirely. An attacker with write access
+        # here has already broken the security boundary far worse
+        # than pickle exposure. Accept pickle for fast cache
+        # load/save of compiled adjacency indices over a code-
+        # execution-class CWE that doesn't apply to this trust
+        # profile.
         idx = pickle.loads(blob[len(_HEADER_MAGIC):])
     except (pickle.UnpicklingError, EOFError, AttributeError,
             ImportError, IndexError, TypeError, ValueError) as exc:
@@ -309,6 +322,8 @@ def save_index(
         return
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions
+        # 0o700 = owner-only — most restrictive POSIX mode.
         os.chmod(_CACHE_DIR, 0o700)
     except OSError as exc:
         logger.debug("reach_cache: dir setup failed: %s", exc)
@@ -327,6 +342,8 @@ def save_index(
                 # newer Python is still readable on older runtimes
                 # in the same dev environment.
                 pickle.dump(index, f, protocol=4)
+            # nosemgrep: python.lang.security.audit.insecure-file-permissions
+            # 0o600 = owner-only file mode (no group/other).
             os.chmod(tmp_path, 0o600)
             os.rename(tmp_path, path)
         except BaseException:
