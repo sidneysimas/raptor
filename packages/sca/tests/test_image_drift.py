@@ -14,12 +14,13 @@ from pathlib import Path
 import pytest
 
 from core.binary import CapabilityFingerprint, save_fingerprint
+from core.binary.fingerprint import FINGERPRINT_SCHEMA_VERSION
 from packages.sca.image_drift import detect_image_drift
 
 
 def _fp(*, sha="abc", buckets=None) -> CapabilityFingerprint:
     return CapabilityFingerprint(
-        schema_version=1,
+        schema_version=FINGERPRINT_SCHEMA_VERSION,
         binary_path="/extracted",
         binary_sha256=sha,
         arch="x86", bits=64, binary_format="elf",

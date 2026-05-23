@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from core.binary.fingerprint import FINGERPRINT_SCHEMA_VERSION
 from packages.sca import fingerprint_cli
 
 
@@ -25,7 +26,7 @@ class TestCliBasics:
         out = capsys.readouterr().out
         data = json.loads(out)
         # Fingerprint shape sanity
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == FINGERPRINT_SCHEMA_VERSION
         assert data["binary_format"] == "elf"
         assert len(data["binary_sha256"]) == 64
 

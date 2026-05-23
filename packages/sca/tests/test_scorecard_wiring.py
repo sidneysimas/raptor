@@ -117,6 +117,7 @@ def _build_llm(scorecard_path: Path):
     client._stats_lock = threading.RLock()
     client._key_locks = {}
     client._key_locks_guard = threading.Lock()
+    client._key_locks_cap = 4096
     client._scorecard = None
     client._cache_write_failures = 0
 
