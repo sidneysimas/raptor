@@ -211,6 +211,16 @@ def add_scan_args(parser: argparse.ArgumentParser) -> None:
              "not just those with maintainer-churn findings",
     )
     parser.add_argument(
+        "--review-slopsquats", action="store_true",
+        help="run LLM verdict on every slopsquat-suspect finding "
+             "(heuristic-flagged LLM-hallucinated package names). "
+             "Off by default — the mechanical heuristic + "
+             "registry co-occurrence escalation usually produces "
+             "a clear-enough signal; the LLM pass is for "
+             "operators who want a narrative verdict on borderline "
+             "matches. No effect when --no-llm is also passed.",
+    )
+    parser.add_argument(
         "--llm-inline-installs", action="store_true",
         help="run LLM pass over Dockerfile/shell/GHA to find deps "
              "the mechanical parser missed (default: off)",
@@ -240,6 +250,7 @@ def apply_no_llm_umbrella(args: argparse.Namespace) -> None:
         args.skip_review = True
         args.skip_triage = True
         args.review_maintainers = False
+        args.review_slopsquats = False
         args.llm_inline_installs = False
         args.impact_analysis = False
 
@@ -274,6 +285,7 @@ def options_from_args(args: argparse.Namespace) -> RunOptions:
         enable_llm_review=not args.skip_review,
         enable_triage=not args.skip_triage,
         review_maintainers=args.review_maintainers,
+        review_slopsquats=args.review_slopsquats,
         enable_llm_inline_installs=args.llm_inline_installs,
         enable_impact_analysis=args.impact_analysis,
         enable_progress=not args.no_progress,

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, List
+from typing import Dict, Iterable, List
 
 from ..models import (
     Dependency,
@@ -54,6 +54,7 @@ from . import orphan_commit_dep as _orphan_commit_dep
 from . import python_imports as _python_imports
 from . import registry_metadata as _registry_metadata
 from . import sentinel as _sentinel
+from . import slopsquat as _slopsquat
 from . import typosquat as _typosquat
 from . import typosquat_domain as _typosquat_domain
 from . import branch_protection as _branch_protection
@@ -118,6 +119,9 @@ def evaluate(
     for ts in _typosquat.scan_deps(deps_list):
         out.append(_typosquat_to_finding(ts))
 
+    for ss in _slopsquat.scan_deps(deps_list):
+        out.append(_slopsquat_to_finding(ss))
+
     for art in _artefacts.scan_target(target, manifests_list):
         out.append(_artefact_to_finding(art))
 
@@ -168,7 +172,129 @@ def evaluate(
         ):
             out.append(_registry_meta_to_finding(rm))
 
+    # Cross-detector severity escalation. registry_metadata has its
+    # own per-dep escalation rule (line ~700 of registry_metadata.py)
+    # that handles correlations WITHIN its own findings. This pass
+    # handles correlations ACROSS detectors — specifically the
+    # "slopsquat finding + recent_publish + low_bus_factor" stack
+    # which is the canonical LLM-hallucination-bait shape:
+    #   * Heuristic flags the name as slopsquat-shape.
+    #   * Registry confirms the package was just published.
+    #   * Single maintainer → newly-registered anonymous publisher.
+    # Each signal alone is moderate noise; the conjunction is the
+    # actual attack signature.
+    _escalate_cross_detector(out)
+
     return out
+
+
+# ---------------------------------------------------------------------------
+# Cross-detector severity escalation
+# ---------------------------------------------------------------------------
+#
+# When multiple detectors fire on the same dep, the combined signal
+# is often stronger than the sum of its parts. registry_metadata's
+# own ``_escalate_severity`` handles correlations within its
+# detector family (recent_publish + maintainer_change + payload_size
+# spike). This function handles correlations across families —
+# specifically the slopsquat ladder, where heuristic-shape +
+# registry-recency + low-bus-factor stack into the "newly registered
+# bait by an anonymous publisher" archetype.
+
+# Severity-rank table for clamping the escalation result so we
+# can't accidentally DOWNGRADE a finding via a max() call.
+_SEVERITY_RANK = {
+    "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
+}
+
+
+def _escalate_cross_detector(findings: List[SupplyChainFinding]) -> None:
+    """Mutate ``findings`` in place: bump slopsquat-finding severity
+    based on co-occurring registry-metadata signals for the same
+    package.
+
+    The conjunction is the actionable signal — heuristic alone
+    is too noisy for non-LLM-paste use cases (legitimate
+    ``lodash-utils`` would fire), but heuristic + "package was
+    first published in the last 30 days" + "single maintainer"
+    is the canonical bait signature.
+    """
+    # Index findings by (ecosystem, name) so co-occurrence is O(1).
+    by_dep: Dict[
+        "tuple[str, str]", List[SupplyChainFinding],
+    ] = {}
+    for f in findings:
+        if f.dependency is None:
+            continue
+        key = (f.dependency.ecosystem, f.dependency.name)
+        by_dep.setdefault(key, []).append(f)
+
+    for slop in findings:
+        if slop.kind != "slopsquat_suspect":
+            continue
+        if slop.dependency is None:
+            continue
+        key = (slop.dependency.ecosystem, slop.dependency.name)
+        sibling_kinds = {
+            f.kind for f in by_dep.get(key, [])
+            if f is not slop
+        }
+        # Recent-publish (first publish < 30 days) OR fresh
+        # version_publish on a previously-dormant package both
+        # signal "just appeared." Either bumps slopsquat by one
+        # severity tier.
+        has_recent = (
+            "recent_publish" in sibling_kinds
+            or "version_publish" in sibling_kinds
+        )
+        # Single maintainer adds the "anonymous publisher"
+        # dimension of the bait shape.
+        has_lone_maintainer = "low_bus_factor" in sibling_kinds
+        # Active maintainer-takeover signal (less likely on a
+        # brand-new bait package but possible if the attacker
+        # adopted an abandoned name).
+        has_maint_change = (
+            "maintainer_change" in sibling_kinds
+            or "maintainer_account_change" in sibling_kinds
+        )
+
+        target_rank = _SEVERITY_RANK.get(slop.severity, 0)
+        reasons: List[str] = []
+        if has_recent and has_lone_maintainer:
+            # Full bait shape: heuristic-shape + just-registered
+            # + anonymous publisher. Critical regardless of the
+            # heuristic's own score.
+            target_rank = max(target_rank, _SEVERITY_RANK["critical"])
+            reasons.append(
+                "co-occurs with recent_publish + low_bus_factor "
+                "(LLM-hallucination-bait archetype)"
+            )
+        elif has_recent or has_maint_change:
+            target_rank = max(target_rank, _SEVERITY_RANK["high"])
+            reasons.append(
+                "co-occurs with "
+                + ("recent_publish " if has_recent else "")
+                + ("maintainer_change " if has_maint_change else "")
+                + "— new-package risk amplifies slopsquat shape"
+            )
+        elif has_lone_maintainer:
+            target_rank = max(target_rank, _SEVERITY_RANK["medium"])
+            reasons.append(
+                "co-occurs with low_bus_factor — single-publisher "
+                "package matching slopsquat shape"
+            )
+
+        # Apply if it's actually an upgrade.
+        new_severity = next(
+            (s for s, r in _SEVERITY_RANK.items() if r == target_rank),
+            slop.severity,
+        )
+        if (_SEVERITY_RANK.get(new_severity, 0)
+                > _SEVERITY_RANK.get(slop.severity, 0)):
+            slop.severity = new_severity      # type: ignore[assignment]
+            existing_evidence = dict(slop.evidence)
+            existing_evidence["escalation_reasons"] = reasons
+            slop.evidence = existing_evidence
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +547,41 @@ def _typosquat_to_finding(
         },
         severity=ts.severity,              # type: ignore[arg-type]
         confidence=ts.confidence,
+    )
+
+
+def _slopsquat_to_finding(
+    ss: _slopsquat.SlopsquatFinding,
+) -> SupplyChainFinding:
+    """LLM-hallucinated-name candidate. Distinct from typosquat
+    (typosquat is character-flip; slopsquat is shape-of-name).
+    Reasons + score are surfaced in evidence so an operator
+    triaging the finding sees WHICH heuristic fired and how
+    strong the cumulative signal is."""
+    suspected = ss.suspected_root
+    detail = (
+        f"name '{ss.dependency.name}' matches the slopsquat shape "
+        f"(LLM-hallucinated package name pattern) — score "
+        f"{ss.score:.2f}, reasons: {', '.join(ss.reasons)}"
+    )
+    if suspected is not None:
+        detail += f"; suspected imitation of '{suspected}'"
+    return SupplyChainFinding(
+        finding_id=(
+            f"sca:supplychain:slopsquat_suspect:"
+            f"{ss.dependency.ecosystem}:{ss.dependency.name}:"
+            f"{ss.dependency.declared_in}"
+        ),
+        kind="slopsquat_suspect",
+        dependency=ss.dependency,
+        detail=detail,
+        evidence={
+            "score": ss.score,
+            "reasons": list(ss.reasons),
+            "suspected_root": suspected,
+        },
+        severity=ss.severity,              # type: ignore[arg-type]
+        confidence=ss.confidence,
     )
 
 

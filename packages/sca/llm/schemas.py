@@ -99,6 +99,40 @@ class MaintainerTrustVerdict(BaseModel):
     )
 
 
+class SlopsquatVerdict(BaseModel):
+    """LLM assessment of a candidate slopsquat package — does
+    the name + registry-metadata profile match the LLM-hallucination
+    bait shape?
+
+    ``verdict`` semantics:
+      * ``probably_slopsquat`` — name is LLM-shape AND registry
+        signals fit the bait archetype (new package, low
+        downloads, anonymous publisher, no upstream repo).
+      * ``probably_legit`` — name MIGHT be LLM-shape but registry
+        signals don't fit bait (established package, real repo,
+        active maintainer history).
+      * ``inconclusive`` — signals mixed or insufficient.
+    """
+
+    verdict: Literal[
+        "probably_slopsquat", "probably_legit", "inconclusive",
+    ]
+    confidence: Literal["low", "medium", "high"]
+    concerns: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Specific bait-shape concerns (e.g. 'first published "
+            "3 days ago', 'single maintainer with no other "
+            "packages', 'README is empty'). Max 5."
+        ),
+    )
+    summary: str = Field(
+        default="",
+        max_length=500,
+        description="3-sentence verdict aimed at the operator.",
+    )
+
+
 # ------------------------------------------------------------------
 # Binary-in-tests review (design §973)
 # ------------------------------------------------------------------

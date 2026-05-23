@@ -402,6 +402,7 @@ SupplyChainKind = Literal[
     "payload_size_spike",
     "workflow_unsigned_commit",
     "branch_protection_missing_signed_commits",
+    "slopsquat_suspect",
 ]
 
 

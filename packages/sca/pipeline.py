@@ -154,6 +154,18 @@ class RunOptions:
                                                 # ``--skip-triage`` disables.
     review_maintainers: bool = False            # Force maintainer-trust
                                                 # review for all direct deps.
+    review_slopsquats: bool = False             # Run LLM verdict on every
+                                                # ``slopsquat_suspect`` finding
+                                                # so an operator gets a narrative
+                                                # ``probably_slopsquat`` /
+                                                # ``probably_legit`` /
+                                                # ``inconclusive`` verdict on
+                                                # heuristic-flagged names.
+                                                # Off by default — the mechanical
+                                                # heuristic + co-occurrence
+                                                # escalation usually produces a
+                                                # clear-enough signal.
+                                                # ``--review-slopsquats``.
     enable_llm_inline_installs: bool = False    # LLM pass over inline
                                                 # install files to catch
                                                 # missed deps.
@@ -1010,6 +1022,20 @@ def _run_llm_stages(
         logger.warning("sca.pipeline: maintainer-trust LLM review failed",
                         exc_info=True)
 
+    # Slopsquat verdict: opt-in via --review-slopsquats. Attaches
+    # an LLM verdict to every ``slopsquat_suspect`` finding (no
+    # finding mutation otherwise — the mechanical heuristic +
+    # co-occurrence escalation drove the severity).
+    if options.review_slopsquats:
+        try:
+            _run_slopsquat_review(
+                client, supply_chain_findings, canonical, http, options,
+            )
+        except Exception:  # noqa: BLE001
+            reviews_failed += 1
+            logger.warning("sca.pipeline: slopsquat LLM review failed",
+                            exc_info=True)
+
     # Version-diff review: compare against previous run's dep versions.
     try:
         vd_count = _run_version_diff_review(
@@ -1121,6 +1147,85 @@ def _run_maintainer_review(client, supply_chain_findings, canonical, http, optio
 
     logger.info("sca.pipeline: LLM maintainer-trust reviewed %d dep(s)",
                  len(deps_to_review))
+
+
+def _run_slopsquat_review(
+    client, supply_chain_findings, canonical, http, options,
+):
+    """Run LLM slopsquat verdict on every ``slopsquat_suspect``
+    finding. Attaches the verdict to the finding's evidence;
+    severity is left alone (the mechanical heuristic +
+    co-occurrence escalation set it already)."""
+    from .llm.slopsquat_verdict import assess_slopsquat
+
+    suspect_findings = [
+        f for f in supply_chain_findings
+        if f.kind == "slopsquat_suspect"
+    ]
+    if not suspect_findings:
+        return
+
+    # Build registry-client lookups for the deps we want to
+    # review. Same offline-honouring pattern as
+    # ``_run_maintainer_review``.
+    from .registries.pypi import PyPIClient
+    from .registries.npm import NpmClient
+    from core.json import JsonCache
+    from . import SCA_CACHE_ROOT
+
+    cache = JsonCache(
+        root=options.cache_root or SCA_CACHE_ROOT,
+    )
+    pypi = PyPIClient(http, cache, offline=options.offline)
+    npm = NpmClient(http, cache, offline=options.offline)
+
+    # Cap at 20 to bound LLM cost — the same cap
+    # ``_run_maintainer_review`` uses. An operator seeing >20
+    # slopsquat suspects has bigger problems than getting the
+    # LLM verdict on the trailing rows.
+    reviewed = 0
+    for f in suspect_findings[:20]:
+        dep = f.dependency
+        meta: Dict[str, Any] = {}
+        try:
+            if dep.ecosystem == "PyPI":
+                meta = pypi.get_metadata(dep.name) or {}
+            elif dep.ecosystem == "npm":
+                meta = npm.get_metadata(dep.name) or {}
+            else:
+                # Other ecosystems don't have client metadata
+                # wired today — skip the LLM call rather than
+                # invoke without registry context.
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+
+        reasons = list(f.evidence.get("reasons", []))
+        score = float(f.evidence.get("score", 0.0))
+        suspected_root = f.evidence.get("suspected_root")
+        verdict = assess_slopsquat(
+            client, dep, reasons, score, suspected_root, meta,
+        )
+        if verdict is None:
+            continue
+
+        # Attach verdict to the finding's evidence. The verdict
+        # is INFORMATIONAL — we don't downgrade or upgrade
+        # severity based on it (the heuristic + registry
+        # co-occurrence already decided that). The operator
+        # gets the narrative pointer for manual triage.
+        existing_evidence = dict(f.evidence)
+        existing_evidence["llm_verdict"] = verdict.verdict
+        existing_evidence["llm_confidence"] = verdict.confidence
+        existing_evidence["llm_summary"] = verdict.summary
+        existing_evidence["llm_concerns"] = list(verdict.concerns)
+        f.evidence = existing_evidence
+        reviewed += 1
+
+    logger.info(
+        "sca.pipeline: LLM slopsquat-verdict reviewed %d suspect(s)",
+        reviewed,
+    )
 
 
 def _run_version_diff_review(client, canonical, supply_chain_findings, http, output_dir):

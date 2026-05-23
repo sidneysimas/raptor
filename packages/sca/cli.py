@@ -197,6 +197,7 @@ def _run_analyse(argv: List[str]) -> int:
         args.skip_review = True
         args.skip_triage = True
         args.review_maintainers = False
+        args.review_slopsquats = False
         args.llm_inline_installs = False
         args.impact_analysis = False
 
