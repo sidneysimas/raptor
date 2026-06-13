@@ -502,6 +502,8 @@ def enrich_from_context_map(model: ThreatModel, context_map: dict[str, Any]) -> 
     if not model.assumptions:
         model.assumptions = seed.assumptions
 
+    if model.source == "operator":
+        model.source = "enriched"
     model.updated_at = datetime.now(timezone.utc).isoformat()
     return model
 
@@ -545,7 +547,7 @@ def save_model(
         try:
             actual_mtime = json_path.stat().st_mtime
         except OSError:
-            actual_mtime = expected_mtime
+            actual_mtime = None
         if actual_mtime != expected_mtime:
             raise RuntimeError(
                 f"threat model at {json_path} was modified by another "
@@ -623,11 +625,13 @@ def render_report(
 ) -> str:
     """Render a higher-signal threat-model report for assessment output."""
     lint = lint if lint is not None else lint_model(model)
-    top_threats = sorted(
-        model.threats,
-        key=lambda t: int(t.get("risk_score") or 0),
-        reverse=True,
-    )[:10]
+    def _safe_risk(t: dict) -> int:
+        try:
+            return int(t.get("risk_score") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    top_threats = sorted(model.threats, key=_safe_risk, reverse=True)[:10]
     lines = []
     logo = _read_raptor_logo()
     if logo:
@@ -635,9 +639,9 @@ def render_report(
     lines.extend([
         "# Threat Model Report",
         "",
-        f"Project: {model.project_name}",
-        f"Target: {model.target}",
-        f"Updated: {model.updated_at}",
+        f"Project: {_safe_for_render(model.project_name)}",
+        f"Target: {_safe_for_render(model.target)}",
+        f"Updated: {_safe_for_render(model.updated_at)}",
         "",
         "## Executive View",
         "",
@@ -657,11 +661,11 @@ def render_report(
         for threat in top_threats:
             lines.append(
                 "- {id} [{status}] risk={risk} severity={severity}: {title}".format(
-                    id=threat.get("id", "?"),
-                    status=threat.get("status", "needs_evidence"),
-                    risk=threat.get("risk_score", 0),
-                    severity=threat.get("severity", "unknown"),
-                    title=threat.get("title", "Untitled threat"),
+                    id=_safe_for_render(threat.get("id", "?")),
+                    status=_safe_for_render(threat.get("status", "needs_evidence")),
+                    risk=_safe_for_render(threat.get("risk_score", 0)),
+                    severity=_safe_for_render(threat.get("severity", "unknown")),
+                    title=_safe_for_render(threat.get("title", "Untitled threat")),
                 )
             )
     else:
@@ -671,10 +675,10 @@ def render_report(
         for ev in model.evidence[:20]:
             lines.append(
                 "- {id} [{oracle}/{status}] {summary}".format(
-                    id=ev.get("id", "?"),
-                    oracle=ev.get("oracle", "?"),
-                    status=ev.get("status", "?"),
-                    summary=ev.get("summary", "no summary"),
+                    id=_safe_for_render(ev.get("id", "?")),
+                    oracle=_safe_for_render(ev.get("oracle", "?")),
+                    status=_safe_for_render(ev.get("status", "?")),
+                    summary=_safe_for_render(ev.get("summary", "no summary")),
                 )
             )
     else:
@@ -684,8 +688,8 @@ def render_report(
         for issue in lint:
             lines.append(
                 "- {severity}: {message}".format(
-                    severity=str(issue.get("severity", "info")).title(),
-                    message=issue.get("message", ""),
+                    severity=_safe_for_render(str(issue.get("severity", "info")).title()),
+                    message=_safe_for_render(issue.get("message", "")),
                 )
             )
     else:
@@ -697,7 +701,7 @@ def render_report(
             values = drift.get(key) or []
             lines.append(f"- {key}: {len(values)}")
             for value in values[:8]:
-                lines.append(f"  - {value}")
+                lines.append(f"  - {_safe_for_render(value)}")
     lines.extend(["", "## Mermaid", "", "```mermaid", "flowchart LR"])
     for flow in model.data_flows[:25]:
         src = _mermaid_id(str(flow.get("source") or flow.get("id") or "source"))
@@ -775,7 +779,10 @@ def lint_model(model: ThreatModel) -> list[dict[str, Any]]:
     }
     for threat in model.threats:
         tid = str(threat.get("id") or "?")
-        score = int(threat.get("risk_score") or 0)
+        try:
+            score = int(threat.get("risk_score") or 0)
+        except (TypeError, ValueError):
+            score = 0
         status = str(threat.get("status") or "needs_evidence")
         controls = [str(c) for c in threat.get("control_ids") or []]
         evidence = [str(e) for e in threat.get("evidence_ids") or []]
@@ -887,11 +894,11 @@ def link_verified_outcomes(model: ThreatModel, outcomes: Iterable[Any]) -> Threa
         ])
         ev = {
             "id": evidence_id,
-            "oracle": data.get("oracle"),
-            "status": data.get("status"),
-            "finding_id": data.get("finding_id"),
-            "cwe_id": data.get("cwe_id"),
-            "file": data.get("file"),
+            "oracle": _clip_str(data.get("oracle")),
+            "status": _clip_str(data.get("status")),
+            "finding_id": _clip_str(data.get("finding_id")),
+            "cwe_id": _clip_str(data.get("cwe_id")),
+            "file": _clip_str(data.get("file")),
             "reproducible": bool(data.get("reproducible")),
             "summary": _outcome_summary(data),
             "raw": _sanitise_raw_evidence(data.get("evidence")),
@@ -1012,16 +1019,18 @@ def _issue(issues: list[dict[str, Any]], severity: str, field: str, message: str
 
 
 def _derive_domain_packs(context_map: dict[str, Any]) -> list[str]:
-    text = " ".join(
-        str(v).lower()
-        for v in (
-            context_map.get("frameworks"),
-            context_map.get("languages"),
-            context_map.get("entry_points"),
-            context_map.get("sink_details"),
-            context_map.get("sinks"),
-        )
-    )
+    parts: list[str] = []
+    for key in ("frameworks", "languages", "entry_points", "sink_details", "sinks"):
+        val = context_map.get(key)
+        if isinstance(val, list):
+            for item in val[:_MAX_LIST_ENTRIES]:
+                if isinstance(item, str):
+                    parts.append(item.lower())
+                elif isinstance(item, dict):
+                    parts.append(str(item.get("name") or "").lower())
+        elif isinstance(val, str):
+            parts.append(val.lower())
+    text = " ".join(parts)
     packs = ["web", "api", "sca"]
     if any(token in text for token in ("malloc", "strcpy", "memcpy", "buffer", "asan", "native")):
         packs.append("native")
@@ -1256,9 +1265,9 @@ def _records(key: str, data: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in value[:_MAX_LIST_ENTRIES]:
         if isinstance(item, dict):
-            out.append(dict(item))
+            out.append({k: _clip_str(v) if isinstance(v, str) else v for k, v in item.items()})
         elif isinstance(item, str) and item.strip():
-            out.append({"id": _stable_id(key.upper(), [item]), "name": item})
+            out.append({"id": _stable_id(key.upper(), [item]), "name": _clip_str(item)})
     return out
 
 
@@ -1427,7 +1436,7 @@ def _outcome_matches_threat(data: dict[str, Any], threat: dict[str, Any]) -> boo
     if cwe_num and (
         (cwe_num == "78" and category == "command_execution")
         or (cwe_num == "89" and category == "sql_injection")
-        or (cwe_num == "79" and "template" in category)
+        or (cwe_num == "1336" and "template" in category)
         or (cwe_num == "22" and category == "path_traversal")
     ):
         return True

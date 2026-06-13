@@ -58,7 +58,7 @@ class Project:
 
     def to_dict(self) -> Dict:
         return {
-            "version": self.version,
+            "version": _PROJECT_SCHEMA_VERSION,
             "name": self.name,
             "target": self.target,
             "output_dir": self.output_dir,

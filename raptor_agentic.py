@@ -135,10 +135,6 @@ def _materialise_threat_model_phase(
     project_backed = project is not None
     if project_backed:
         json_path, markdown_path = project_threat_model_paths(project)
-        configured_path = getattr(project, "threat_model_path", "")
-        if configured_path:
-            json_path = Path(configured_path)
-            markdown_path = json_path.with_name("THREAT_MODEL.md")
     else:
         json_path = out_dir / "threat-model.json"
         markdown_path = out_dir / "THREAT_MODEL.md"
@@ -160,18 +156,24 @@ def _materialise_threat_model_phase(
             load_mtime = None
 
     existing_model = load_model(json_path) if project_backed else None
-    if existing_model is not None and not refresh:
-        model = enrich_from_context_map(existing_model, context_map)
-        save_model(model, json_path, markdown_path, expected_mtime=load_mtime)
-        summary["model_preserved"] = True
-        summary["model_refreshed"] = False
-        summary["model_migrated"] = True
-    else:
-        model = from_context_map(project, context_map)
-        save_model(model, json_path, markdown_path)
-        summary["model_preserved"] = False
-        summary["model_refreshed"] = True
-        summary["model_migrated"] = False
+    try:
+        if existing_model is not None and not refresh:
+            model = enrich_from_context_map(existing_model, context_map)
+            save_model(model, json_path, markdown_path, expected_mtime=load_mtime)
+            summary["model_preserved"] = True
+            summary["model_refreshed"] = False
+            summary["model_migrated"] = True
+        else:
+            model = from_context_map(project, context_map)
+            save_model(model, json_path, markdown_path)
+            summary["model_preserved"] = False
+            summary["model_refreshed"] = True
+            summary["model_migrated"] = False
+    except RuntimeError as e:
+        logger.warning(f"Threat model save refused (concurrent writer?): {e}")
+        model = existing_model or from_context_map(project, context_map)
+        summary["model_preserved"] = existing_model is not None
+        summary["model_refreshed"] = existing_model is None
 
     linked_outcomes = 0
     try:
@@ -213,8 +215,6 @@ def _materialise_threat_model_phase(
         project_threat_model_report_path(project)
         if project_backed else out_dir / "threat-model-report.md"
     )
-    if project_backed and configured_path:
-        report_path = json_path.with_name("threat-model-report.md")
     save_report(model, report_path, lint=lint, drift=drift)
     lint_path = out_dir / "threat-model-lint.json"
     drift_path = out_dir / "threat-model-drift.json"
